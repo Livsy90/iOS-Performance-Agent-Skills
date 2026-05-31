@@ -14,13 +14,11 @@ It is a collection of reusable guidance files for AI-assisted code review, refac
 
 ## Included skills
 
----
 ### `ios-launch-performance`
 
 For analyzing app startup and launch-time regressions.
 
 Covers cold, warm, and prewarmed launch, dyld and pre-main work, static initializers, AppDelegate, SceneDelegate, SwiftUI app entry points, first frame, SDK initialization, launch metrics, and validation with tools such as Instruments, XCTest, and MetricKit.
----
 
 ### `ios-performance-profiling`
 
