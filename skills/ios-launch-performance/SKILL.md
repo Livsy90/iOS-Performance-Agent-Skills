@@ -1,5 +1,4 @@
 ---
-
 name: ios-launch-performance
 description: Use this skill when reviewing or diagnosing iOS app launch performance, including cold launch, warm launch, prewarmed launch, resume-vs-launch confusion, dyld and pre-main work, Objective-C +load/+initialize, static initializers, static vs dynamic linking, mergeable libraries, AppDelegate/SceneDelegate startup, SwiftUI App initialization, launch orchestration, dependency graphs, first-frame readiness, MetricKit, XCTest launch metrics, and Instruments App Launch traces. Trigger when reviewing AppDelegate, SceneDelegate, SwiftUI @main App, root view creation, dependency container setup, launch step ordering, third-party SDK initialization, framework linking strategy, Objective-C runtime hooks, constructor functions, or slow launch symptoms caused by pre-main or main-thread startup work.
 ---
