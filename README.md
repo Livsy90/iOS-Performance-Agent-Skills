@@ -10,7 +10,7 @@ This repository contains practical performance-focused instructions for AI codin
 
 The skills are designed to help an agent reason about iOS performance problems with a more structured mental model: what to inspect, what to avoid assuming, which trade-offs matter, and when measurement is required.
 
-This is not an iOS framework, Swift package, or profiling tool. It is a collection of reusable guidance files for AI-assisted code review, refactoring, and investigation.
+It is a collection of reusable guidance files for AI-assisted code review, refactoring, and investigation.
 
 ## Included skills
 
