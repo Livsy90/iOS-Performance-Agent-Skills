@@ -1,4 +1,4 @@
-# iOS Performance Skills
+# iOS Performance Agent Skills
 
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
