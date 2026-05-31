@@ -1,112 +1,411 @@
 # AppDelegate, SceneDelegate, and First Frame
 
-Use this reference when a launch investigation points to application lifecycle code, scene lifecycle code, dependency setup during startup, root UI creation, first-screen preparation, or main-thread work that delays the first visible app frame.
+Use this reference when a launch investigation points to UIKit lifecycle code, scene lifecycle code, root UI creation, first-screen preparation, routing during launch, dependency setup from lifecycle callbacks, or main-thread work that delays the first visible app-rendered frame.
 
-Keep this reference focused on work that happens after the app enters its own lifecycle code and before the first useful UI becomes visible and responsive. Do not use it as the primary guide for dyld/pre-main, framework linking strategy, SwiftUI `@main App` startup, third-party SDK policy, or measurement tool setup.
+Keep this file focused on the path after the app enters its own lifecycle code and before the first useful UI is visible and responsive. Do not use it as the primary guide for dyld, linking, SwiftUI `App`, vendor SDK policy, or measurement tooling.
 
 ## Scope Boundary
 
 This file covers:
 
-- `UIApplicationDelegate` launch callbacks
-- `UISceneDelegate` scene connection callbacks
-- root `UIWindow` and root view controller setup
-- first-screen view controller creation
-- dependency setup that happens in app or scene lifecycle code
-- main-thread startup work before first frame
-- state restoration, launch options, deep links, notifications, and routing when they affect first-screen readiness
-- deferral decisions for app-owned launch work
+* `UIApplicationDelegate` launch callbacks
+* `UISceneDelegate` connection and activation callbacks when they affect startup
+* apps with and without the scene lifecycle
+* `UIWindow` and root view controller setup
+* first-screen coordinator or view controller creation
+* launch options, universal links, notification launches, shortcuts, and restoration when they affect initial routing
+* app-owned dependency setup called from lifecycle code
+* main-thread work before first frame and early responsiveness
+* deciding what must stay on the first-frame path and what can move later
 
 This file does not cover:
 
-- dyld, pre-main, Objective-C `+load`, `+initialize`, constructors, or static initializer internals; use `pre-main-dyld-and-static-initializers.md`
-- static vs dynamic linking, mergeable libraries, or framework count; use `linking-strategy.md`
-- SwiftUI `@main App`, root SwiftUI view initialization, `.task`, `.onAppear`, or observable state setup; use `swiftui-app-launch.md`
-- SDK-specific startup policy for analytics, ads, crash reporting, attribution, push, remote config, feature flags, or security vendors; use `third-party-sdks-at-launch.md`
-- Instruments, XCTest, MetricKit, Organizer, signpost design, or CI baseline setup; use `metrics-instruments-xctest-metrickit.md`
-- general scrolling, rendering, memory, networking, or architecture review unless the work is on the launch path
+* dyld, pre-main work, Objective-C `+load`, `+initialize`, constructor functions, or static initializer contents; use `pre-main-dyld-and-static-initializers.md`
+* static vs dynamic linking, mergeable libraries, framework count, or binary layout; use `linking-strategy.md`
+* large ordered launch step systems, dependency graph scheduling, or safe parallel startup orchestration; use `launch-orchestration-and-dependency-graph.md`
+* SwiftUI `@main App`, root SwiftUI views, `.task`, `.onAppear`, or observable state setup; use `swiftui-app-launch.md`
+* SDK-specific startup decisions for analytics, ads, crash reporting, attribution, push, remote config, feature flags, or security vendors; use `third-party-sdks-at-launch.md`
+* Instruments, XCTest, MetricKit, Organizer, signpost design, or CI baselines; use `metrics-instruments-xctest-metrickit.md`
+* general rendering, scrolling, memory, networking, or architecture review unless the work is on the launch path
 
-## Core Model
+## UIKit Launch Model
 
-After pre-main work completes, UIKit starts the app lifecycle and gives the app a chance to configure shared process-level state, connect scenes, build a window, create the first screen, and submit the first frame.
-
-For launch performance, treat this area as a critical path:
+After pre-main work finishes, UIKit asks the app to prepare itself for execution and user interaction. In a UIKit app, launch-time app code commonly flows through:
 
 ```text
-UIApplicationDelegate startup
-→ optional scene session configuration
-→ UISceneDelegate scene connection
+App delegate creation and stored-property initialization
+→ willFinishLaunching / didFinishLaunching
+→ scene session configuration, if scenes are used
+→ scene connection, if a UI scene is created or restored
 → window and root controller creation
-→ first screen model/state preparation
-→ first layout/draw/commit
-→ early responsiveness after the first frame
+→ first-screen state preparation
+→ first layout, draw, and frame commit
+→ early responsiveness after visible UI
 ```
 
-The goal is not to make lifecycle methods empty. The goal is to ensure that only work required for a correct first frame or first interaction stays on this path.
+The goal is not to make lifecycle methods empty. The goal is to keep only work required for a correct first frame or first interaction on this path.
 
-## Lifecycle Responsibilities
+## Lifecycle Facts to Preserve
 
-### App Delegate
+Use these facts when reviewing code:
+
+* UIKit creates the app delegate early in the app launch cycle.
+* Even apps that use scenes still use the app delegate for process-level launch and termination responsibilities.
+* `application(_:willFinishLaunchingWithOptions:)` and `application(_:didFinishLaunchingWithOptions:)` are app-launch callbacks, not a general place for all app setup.
+* `application(_:configurationForConnecting:options:)` can be called when UIKit needs a scene configuration. It should choose or return configuration cheaply, not build the full UI graph.
+* `scene(_:willConnectTo:options:)` is called when UIKit creates or restores an instance of the app UI. This can happen on initial launch, but also when creating or restoring additional scenes.
+* A scene owns a UI instance: windows, view controllers, and scene-specific coordination belong there when the app uses the scene lifecycle.
+* Multiple scenes share the same app process and app-wide services. App-wide bootstrap must not accidentally run once per scene.
+* If a remote notification launches a non-running app, launch information is delivered through launch options; do not assume the normal notification callback runs before launch handling.
+
+## App Delegate Responsibilities
 
 Use the app delegate for process-level startup and app-wide lifecycle coordination.
 
-Review code in:
+Review:
 
-- `application(_:willFinishLaunchingWithOptions:)`
-- `application(_:didFinishLaunchingWithOptions:)`
-- `application(_:configurationForConnecting:options:)`
-- app delegate initializers and stored property initialization
-- custom bootstrap objects called from app delegate methods
+* app delegate `init` and stored properties
+* `application(_:willFinishLaunchingWithOptions:)`
+* `application(_:didFinishLaunchingWithOptions:)`
+* `application(_:configurationForConnecting:options:)`
+* bootstrap objects called from these methods
+* app-wide service containers created from the app delegate
 
-Typical launch-safe responsibilities:
+Appropriate launch-time responsibilities may include:
 
-- install a minimal root coordinator or bootstrap object
-- configure app-wide behavior that must exist before scenes connect
-- decide high-level launch routing state when it is cheap and local
-- register critical services that must observe launch or crash immediately
-- return quickly enough for scene connection and first UI creation to continue
+* installing a small bootstrap coordinator
+* configuring app-wide invariants that must exist before any UI code runs
+* selecting high-level local routing state when the decision is cheap
+* registering required process-level handlers
+* preparing scene configuration without building scene UI
+* returning quickly so scene connection and first-frame work can continue
 
-Common launch risks:
+High-risk patterns:
 
-- building the full application dependency graph synchronously
-- opening databases before the first screen needs them
-- running migrations on the main thread
-- performing keychain-heavy checks synchronously
-- waiting for network, remote config, reachability, token refresh, or feature flag fetches
-- parsing large local files
-- registering many observers, notification handlers, or routers eagerly
-- initializing every subsystem because it is convenient from one central method
-- doing UI work in both app delegate and scene delegate for the same window
+* full dependency graph construction
+* opening or migrating databases before the first screen needs them
+* synchronous keychain-heavy checks
+* waiting for network, reachability, token refresh, remote config, or feature flag fetches
+* large file reads, JSON parsing, or local index construction
+* registering every observer, router, notification pipeline, and feature service eagerly
+* starting feature modules that are unreachable from the first screen
+* creating UI in the app delegate when a scene delegate also owns the window
+* doing work here because the method is a convenient central place rather than because the work is launch-critical
 
-### Scene Delegate
+Prefer:
+
+* thin app delegate methods
+* explicit process-level bootstrap with narrow responsibilities
+* cheap local state over remote decisions
+* one-time app-wide setup that is idempotent
+* lightweight factory registration rather than eager instance construction
+* deferring feature-specific setup to the feature boundary
+
+## Scene Delegate Responsibilities
 
 Use the scene delegate for scene-specific UI creation and scene lifecycle coordination.
 
-Review code in:
+Review:
 
-- `scene(_:willConnectTo:options:)`
-- `sceneWillEnterForeground(_:)`
-- `sceneDidBecomeActive(_:)`
-- custom scene coordinators called during connection
-- root window and root controller factories
+* `scene(_:willConnectTo:options:)`
+* scene delegate `init` and stored properties
+* custom scene coordinators called during connection
+* window creation and root controller factories
+* `sceneDidBecomeActive(_:)` and `sceneWillEnterForeground(_:)` when they rerun launch-like work
 
-Typical launch-safe responsibilities:
+Appropriate launch-time responsibilities may include:
 
-- create a `UIWindow` for the connected `UIWindowScene`
-- create a minimal root controller or root coordinator
-- apply scene-specific routing input from connection options
-- make the window visible
-- schedule noncritical scene work outside the first-frame path
+* creating a `UIWindow` for the provided `UIWindowScene`
+* installing a minimal root controller, shell, or coordinator
+* applying scene-specific routing inputs from connection options
+* making the window visible
+* scheduling scene-specific secondary work outside the first-frame path
 
-Common launch risks:
+High-risk patterns:
 
-- duplicating root UI construction already done by the app delegate
-- doing heavy routing before any placeholder/root UI exists
-- creating multiple complete navigation stacks during startup
-- restoring complex UI state synchronously
-- loading large first-screen data sets before showing any UI
-- performing synchronous image loading, decoding, or layout-heavy setup
-- treating every scene connection as a fresh app launch without checking the scenario
+* recreating app-wide services per scene
+* treating every scene connection as a full app launch
+* building every tab and navigation branch before first frame
+* restoring complex screens synchronously
+* completing deep-link navigation before a root shell is visible
+* loading first-screen data synchronously before any valid UI exists
+* creating multiple complete navigation stacks during startup
+* doing heavy foreground-refresh work in both launch and activation callbacks
+
+Prefer:
+
+* minimal root UI that can appear quickly
+* cheap route selection from local state
+* progressive scene-specific data loading
+* idempotent scene setup
+* lazy construction of tabs, routes, and feature coordinators
+* clear separation between app-wide services and scene-owned UI state
+
+## Apps Without Scene Lifecycle
+
+Some apps still create their root window from the app delegate.
+
+When scenes are not used, review the app delegate for both process-level setup and root UI setup. The same launch-performance rules apply, but the app delegate has more responsibility:
+
+* create the window
+* install the minimal root controller
+* make the window visible
+* avoid broad dependency setup before the first frame
+* defer feature-specific or maintenance work
+
+Do not recommend moving work to `UISceneDelegate` unless the app actually uses or is migrating to the scene lifecycle.
+
+## Startup Task Classification
+
+Before recommending deferral, classify each task by when the app truly needs it.
+
+### Required before first frame
+
+Keep only work required to show a correct first visible UI.
+
+Examples:
+
+* creating the window and minimal root controller
+* choosing login, locked, onboarding, or main shell from small local state
+* setting invariants required before UI code runs
+* registering a process-level component that must observe the earliest launch behavior
+* parsing launch input only enough to decide the first safe UI
+
+Even required work should be checked for main-thread blocking, unnecessary breadth, and hidden eager construction.
+
+### Required before first interaction
+
+This work does not need to block the first frame, but the UI may need it before controls become enabled.
+
+Examples:
+
+* preparing minimal first-screen view model state
+* reading cached data required by immediate controls
+* validating a local session timestamp
+* restoring lightweight navigation context
+* enabling observers needed for first-screen actions
+
+If interaction depends on this work, the UI needs a clear loading, disabled, or placeholder state.
+
+### Needed soon after launch
+
+This work is useful shortly after launch but should not block visible UI.
+
+Examples:
+
+* refreshing cached user data
+* warming small first-navigation caches
+* refreshing local configuration that has a safe default
+* preparing background sync state
+* scheduling noncritical observers
+
+Schedule this work after a clear readiness point and verify it does not compete with early user interaction.
+
+### Feature-specific and lazy
+
+Feature-specific services should start when the feature is opened or when its data is actually needed.
+
+Examples:
+
+* search index setup for a later screen
+* map, camera, media, payment, or document modules not visible at launch
+* secondary tab data providers
+* optional personalization or recommendations
+* admin, debug, or diagnostics tools
+
+Do not initialize feature modules from lifecycle callbacks just because they are globally reachable.
+
+### Background maintenance
+
+Maintenance work should not block the first frame or first interaction.
+
+Examples:
+
+* cache cleanup
+* log compaction
+* old file deletion
+* analytics batch upload
+* nonurgent sync repair
+* database vacuuming that is not required for immediate correctness
+
+Use appropriate priority, cancellation, and battery/network awareness. Avoid starting all maintenance immediately after first frame if it causes visible jank.
+
+## Work That May Need to Stay Early
+
+Avoid blanket deferral. Some work may have legitimate launch-time requirements.
+
+Treat these as context-sensitive rather than automatically deferrable:
+
+* crash reporting needed before any code can fail silently
+* security, fraud, compliance, or jailbreak/root detection required before sensitive UI
+* session lock or privacy state needed before showing user data
+* local feature flags or kill switches required to choose safe UI
+* deep link or notification parsing required to choose the initial shell
+* background task registration that the platform expects during launch
+* minimal analytics or logging required for regulated audit trails
+
+For each case, ask whether the full setup is required or whether a smaller early mode can run before the rest is deferred.
+
+## Root UI and First Frame
+
+The first frame should be minimal, correct, and visually stable. It does not need to contain every final piece of data.
+
+Review root UI creation for:
+
+* expensive root view controller initializers
+* view models that start work in `init`
+* coordinators that create many screens immediately
+* tab controllers that eagerly build all tab contents
+* navigation restoration that reconstructs heavy screens before any shell appears
+* synchronous image loading, decoding, resizing, or asset processing
+* large table or collection data sets loaded before first draw
+* complex first-screen Auto Layout or view hierarchy setup
+* blocking state restoration
+
+Prefer:
+
+* shell-first UI with progressive loading
+* cached, placeholder, or skeleton content when valid for the product
+* minimal route state before deeper navigation
+* lazy tab and feature construction
+* narrow root view model dependencies
+* delayed enrichment after visible UI
+* explicit loading, locked, or disabled states instead of launch blocking
+
+Do not show an empty or misleading shell just to win the first-frame metric. The first UI must still be correct for the user state and safe for the product domain.
+
+## Routing, Launch Options, and State Restoration
+
+Launch input can force early routing decisions, but it should not force full feature initialization.
+
+Relevant inputs include:
+
+* universal links
+* custom URL schemes
+* remote or local notification launches
+* quick actions
+* handoff and user activities
+* state restoration
+* scene restoration activities
+
+Recommended model:
+
+1. Parse launch input cheaply.
+2. Store a minimal pending route or initial intent.
+3. Show a safe root UI.
+4. Resolve expensive authorization, data, or module requirements after the root UI exists.
+5. Complete deep-link or notification navigation only when the required state is available.
+
+Review for:
+
+* deep-link handlers that build full feature modules before root UI
+* notification handlers that fetch remote data synchronously during launch
+* restoration code that recreates complex screens before showing a shell
+* authentication refresh that blocks route selection
+* router/session/root UI dependency cycles
+* scene restoration that reruns app-wide bootstrap
+
+Prefer pending-route models over blocking route completion during app delegate or scene connection.
+
+## Dependency Setup on the Launch Path
+
+Dependency containers often hurt launch because they make whole-app construction easy.
+
+Review for:
+
+* `build`, `registerAll`, `resolveAll`, `assemble`, or similar all-app setup during launch
+* registrations that construct concrete instances instead of factories
+* eager singletons that open files, start threads, subscribe to streams, or touch storage
+* root view models that resolve broad dependencies
+* feature modules registered before they are reachable
+* hidden work in property initializers of dependency objects
+
+Prefer:
+
+* lightweight factory registration
+* a separate launch-critical dependency slice
+* constructing only the root dependencies needed by the first screen
+* lazy feature module registration or construction
+* explicit async preparation after visible UI where needed
+* narrow protocols for first-screen dependencies
+
+If the dependency graph is large and ordered, route to `launch-orchestration-and-dependency-graph.md` instead of trying to solve orchestration inside this reference.
+
+## Main-Thread Startup Work
+
+Lifecycle callbacks commonly lead to main-thread work. UI setup must happen on the main thread, but blocking or broad non-UI work should be challenged.
+
+High-risk patterns:
+
+* synchronous file reads or writes
+* keychain calls on the first-frame path
+* database open or migration on the main thread
+* large JSON or property list decoding
+* image decoding, resizing, or asset processing
+* waiting on semaphores, dispatch groups, locks, or synchronous dispatch
+* synchronous network wrappers
+* expensive logging or analytics formatting
+* broad notification registration with side effects
+* large diffing or data transformation before first frame
+* localization, theme, or configuration rebuilds with wide side effects
+
+When moving work off the main thread, verify:
+
+* the API is thread-safe
+* UI state updates return to the correct actor or thread
+* the first screen has a valid loading or disabled state
+* cancellation and priority are appropriate
+* background work does not immediately compete with first interaction
+* failure handling is clear
+
+Do not recommend backgrounding work simply to hide it. Work required for correctness may require a better first-frame design rather than a thread change.
+
+## Deferral Patterns
+
+Use explicit deferral points instead of vague “do it later” advice.
+
+Possible deferral points:
+
+* after the minimal root UI is installed
+* after the first screen appears
+* after the first user interaction
+* after authentication or local session state is known
+* after the first critical data request completes
+* when a specific tab, route, or feature is opened
+* when the app is idle enough for maintenance work
+* during a background-friendly maintenance window
+
+When suggesting deferral, specify:
+
+* what moves
+* why it is not required before first frame
+* which event triggers it
+* what state the UI shows before completion
+* how cancellation and failure are handled
+* how the improvement will be measured
+
+Avoid using `DispatchQueue.main.async` as proof that work happens after the first displayed frame. It only moves work out of the current synchronous call stack. Use lifecycle points, readiness signals, signposts, or traces to confirm timing.
+
+## Multiple Scenes and Idempotency
+
+Scene-based apps can have more than one UI instance. Launch reviews should not assume a single global scene.
+
+Check:
+
+* whether app-wide bootstrap runs once or once per scene
+* whether services are safe when two scenes connect close together
+* whether scene restoration recreates global state
+* whether a second window triggers first-launch-only work
+* whether scene-specific state is stored globally by accident
+* whether foregrounding one scene restarts work intended for process launch
+
+Prefer:
+
+* app-wide services owned by a process-level container
+* scene-owned coordinators for UI state
+* idempotent setup methods
+* explicit one-time guards for process bootstrap
+* scene-specific pending routes and restoration state
 
 ## What the Agent Can Inspect
 
@@ -118,304 +417,44 @@ Search for lifecycle entry points:
 rg "didFinishLaunching|willFinishLaunching|configurationForConnecting|willConnectTo|sceneDidBecomeActive|sceneWillEnterForeground" .
 ```
 
-Search for common startup work inside lifecycle files and bootstrap code:
+Search for bootstrap and dependency setup language:
 
 ```sh
-rg "bootstrap|configure|start|initialize|setup|register|migrate|open|load|restore|resolve|container|coordinator" .
+rg "bootstrap|configure|start|initialize|setup|register|migrate|open|load|restore|resolve|container|coordinator|assemble" .
 ```
 
 Search for blocking or expensive operations near startup paths:
 
 ```sh
-rg "Data\(|contentsOf:|FileManager|Keychain|SecItem|UserDefaults|JSONDecoder|PropertyListDecoder|sleep|wait\(|semaphore|sync\(|performAndWait|DispatchQueue\.main\.sync" .
+rg "Data\\(|contentsOf:|FileManager|Keychain|SecItem|UserDefaults|JSONDecoder|PropertyListDecoder|sleep|wait\\(|semaphore|sync\\(|performAndWait|DispatchQueue\\.main\\.sync" .
 ```
 
-Search for root UI creation and duplication:
+Search for root UI creation and potential duplication:
 
 ```sh
-rg "UIWindow\(|rootViewController|makeKeyAndVisible|UINavigationController\(|UITabBarController\(|UIHostingController" .
+rg "UIWindow\\(|rootViewController|makeKeyAndVisible|UINavigationController\\(|UITabBarController\\(|UIHostingController" .
 ```
 
-Use search results carefully. A match is a lead, not proof of launch impact. Confirm whether the matched code actually runs before first frame and whether it blocks the main thread.
+Use search results as leads, not proof. Confirm whether matched code actually runs before first frame and whether it blocks the main thread or early interaction.
 
 The agent can:
 
-- trace lifecycle call chains from app/scene delegates into bootstrap code
-- identify synchronous work on the launch path
-- classify startup tasks by necessity
-- suggest moving work to explicit readiness points
-- propose lazy initialization for feature-scoped services
-- suggest minimal root UI or placeholder state where appropriate
-- add or recommend lightweight app-owned phase markers when measurement is missing
-- propose code patches if the repository is available and the change is local and safe
+* trace lifecycle call chains from app and scene delegates into bootstrap code
+* identify synchronous work on the launch path
+* classify startup tasks by necessity
+* suggest explicit readiness points
+* propose lazy initialization for feature-scoped services
+* recommend minimal root UI or placeholder state where appropriate
+* add or recommend lightweight app-owned launch phase markers
+* propose small local code patches when the repository is available and the change is safe
 
 The agent cannot reliably:
 
-- prove first-frame timing without a trace or measurement
-- assume `DispatchQueue.main.async` means work runs after the first displayed frame
-- know third-party SDK internal launch cost without documentation, symbols, traces, or vendor guidance
-- decide that a security, crash reporting, routing, or compliance requirement can be deferred without product/context validation
-- convert a synchronous dependency into async/lazy setup without checking call-site semantics
-
-## Startup Task Classification
-
-Before recommending deferral, classify each task by when the app truly needs it.
-
-### Required before first frame
-
-Keep only work that is necessary to show a correct first visible UI.
-
-Examples:
-
-- creating the window and minimal root controller
-- selecting the initial shell or high-level route from already-local state
-- reading tiny, already-local state that determines whether the first screen is login, locked, onboarding, or main shell
-- setting critical app-wide invariants required before any UI code runs
-- starting a crash reporter or security component when the product requires it before any user interaction
-
-Even required work should be reviewed for main-thread blocking, unnecessary breadth, and avoidable eager dependency construction.
-
-### Required before first interaction
-
-Some work does not need to block first frame but should complete before the user taps or before the first screen becomes fully interactive.
-
-Examples:
-
-- preparing the first screen's minimal view model state
-- verifying a local session expiration timestamp
-- restoring lightweight navigation context
-- loading cached data needed for immediate controls
-- enabling critical observers for first-screen actions
-
-Move this work out of `didFinishLaunching` when possible, but ensure the UI has a clear loading, disabled, or placeholder state if interaction depends on it.
-
-### Needed soon after launch
-
-Some work is useful shortly after launch but should not delay first frame.
-
-Examples:
-
-- refreshing cached user data
-- warming small caches used by the first few screens
-- scheduling noncritical observers
-- refreshing local configuration that has a safe default
-- preparing background sync state
-
-Prefer explicit post-visible or post-first-interaction scheduling, and verify that the work does not create early interaction jank.
-
-### Feature-specific and lazy
-
-Feature-specific services should start when the feature is opened or when its data is actually needed.
-
-Examples:
-
-- search index setup for a screen not shown at launch
-- map, camera, media, or payment modules not visible on the first screen
-- secondary tab data providers
-- optional personalization engines
-- admin/debug tools
-
-Do not initialize feature modules from app delegate simply because they are globally reachable.
-
-### Background maintenance
-
-Maintenance tasks should not block visible UI.
-
-Examples:
-
-- cache cleanup
-- log compaction
-- old file deletion
-- database vacuuming
-- analytics batch upload
-- nonurgent sync repair
-
-Schedule these with appropriate priority, cancellation, and battery/network awareness. Avoid starting all maintenance immediately after first frame if it competes with early user interaction.
-
-## AppDelegate Review Rules
-
-When reviewing app delegate code, ask these questions:
-
-1. Does this method create only the app-wide state needed before the first scene or first frame?
-2. Does any call chain perform synchronous I/O, network waiting, database work, keychain access, migration, parsing, locking, or large allocation?
-3. Is a full dependency graph built when only a small root subset is needed?
-4. Are launch options handled cheaply, or do they trigger heavy routing and data loading?
-5. Is UI setup duplicated with scene delegate code?
-6. Is the app doing work here only because this method is a convenient central place?
-7. Is the work safe to move later, lazy-load, or split into critical and noncritical parts?
-
-Prefer:
-
-- a thin app delegate
-- explicit bootstrap objects with narrow responsibilities
-- cheap local state reads over remote decisions
-- small root dependency sets
-- lazy service registration for feature-specific services
-- clear boundaries between process-level startup and scene-specific UI
-
-Avoid:
-
-- a single `configureEverything()` call with hidden work
-- unconditional service startup for every app subsystem
-- blocking the main thread while waiting for remote state
-- long synchronous migrations during launch
-- creating UI in multiple lifecycle locations for the same scene
-- using app delegate as a general dependency container initializer
-
-## SceneDelegate Review Rules
-
-When reviewing scene delegate code, ask these questions:
-
-1. Does `scene(_:willConnectTo:options:)` create only the scene-specific UI needed now?
-2. Can the root controller appear before heavy data or secondary modules are ready?
-3. Does scene connection restore too much navigation or data synchronously?
-4. Are connection options handled without blocking visible UI?
-5. Is each scene treated independently when the app supports multiple windows?
-6. Does a returning or additional scene accidentally rerun app-wide bootstrap?
-7. Are root controllers and coordinators cheap to construct?
-
-Prefer:
-
-- a minimal root controller or shell
-- route selection from cheap local state
-- progressive first-screen loading
-- scene-specific coordinators with explicit dependencies
-- delayed restoration for heavy secondary state
-- idempotent scene setup
-
-Avoid:
-
-- recreating app-wide services per scene
-- building every tab or navigation branch before the first frame
-- performing blocking authentication refresh during scene connection
-- loading large images, files, or data sets synchronously
-- doing expensive view hierarchy construction before any lightweight root is visible
-
-## Root UI and First Frame
-
-The first frame should be minimal, valid, and visually stable. It does not need to contain every final piece of data.
-
-Review root UI creation for:
-
-- expensive root view controller initializers
-- view models that start work in `init`
-- coordinators that construct many screens immediately
-- tab controllers that eagerly build every tab's full content
-- navigation stacks restored with heavy screens before any shell appears
-- synchronous image decoding or asset processing
-- complex Auto Layout setup on the first screen
-- first-screen tables or collections populated with large data sets synchronously
-- blocking state restoration
-
-Prefer first-frame strategies such as:
-
-- shell-first UI with progressive data loading
-- lightweight login/locked/onboarding/main-shell decision
-- cached or placeholder state when remote data is not required for correctness
-- lazy tab or feature construction
-- minimal root view model state
-- delayed enrichment after visible UI
-- explicit loading states instead of blocking launch
-
-Be careful: showing an empty or broken shell is not a launch improvement. The first frame must still be correct for the user's state and safe for the product domain.
-
-## Routing, Launch Options, and State Restoration
-
-Launch options, universal links, notifications, shortcuts, handoff, and restoration can force early routing decisions. Handle them without turning launch into full feature initialization.
-
-Recommended approach:
-
-1. Parse launch input cheaply.
-2. Decide the minimal initial route or pending route.
-3. Show a valid root UI quickly.
-4. Resolve expensive data or authorization checks asynchronously when the UI has a safe loading state.
-5. Complete deep-link or notification navigation only after required state is available.
-
-Review for:
-
-- deep-link handlers that load full feature modules before root UI appears
-- notification handlers that fetch remote data synchronously during launch
-- restoration code that recreates complex screens before showing a shell
-- authentication refresh that blocks route selection
-- dependency cycles between router, session manager, and root UI creation
-
-Prefer pending-route models over blocking route completion during `didFinishLaunching` or scene connection.
-
-## Dependency Setup on the Launch Path
-
-Dependency containers are common launch bottlenecks because they make it easy to construct the whole app graph at once.
-
-Review for:
-
-- container `build`, `registerAll`, `resolveAll`, or `assemble` calls during launch
-- services registered by constructing concrete instances instead of factories
-- eager singletons that start I/O or threads during registration
-- root view models that resolve broad dependencies
-- feature modules registered before they are reachable
-- hidden work in property initializers of dependency objects
-
-Prefer:
-
-- registration of lightweight factories over eager instances
-- separating launch-critical services from feature services
-- constructing only the root dependency slice needed for the first screen
-- lazy module loading for secondary features
-- explicit async preparation steps after first UI when needed
-- narrow protocols for first-screen dependencies
-
-Avoid turning dependency setup into global hidden work. If the dependency graph is too broad, splitting it often improves both launch performance and architectural clarity.
-
-## Main-Thread Work
-
-App delegate and scene delegate callbacks run as part of startup and commonly lead to main-thread work. Main-thread work is not automatically bad: UI setup must happen there. The problem is blocking, CPU-heavy, I/O-heavy, or unnecessarily broad work that prevents first frame or early interaction.
-
-High-risk patterns:
-
-- synchronous file reads or writes
-- keychain calls on the critical path
-- database open/migration on the main thread
-- large JSON or property list decoding
-- image decoding or resizing
-- waiting on semaphores, groups, locks, or synchronous dispatch
-- synchronous network wrappers
-- expensive logging or analytics formatting
-- large collection diffing before first frame
-- rebuilding localization, theme, or configuration objects with broad side effects
-
-When moving work off the main thread, verify:
-
-- the API is thread-safe
-- UI state is updated on the correct actor/thread
-- the first screen has a valid loading state
-- cancellation and priority are appropriate
-- background work does not immediately compete with early interaction
-
-Do not recommend backgrounding work simply to hide it. Work that is required for correctness may need a better first-frame design rather than an unsafe thread move.
-
-## Deferral Patterns
-
-Use explicit deferral points instead of vague "do it later" advice.
-
-Possible deferral points:
-
-- after minimal root UI is visible
-- after first screen appears
-- after first user interaction
-- after authentication/session state is known
-- after the first critical data request completes
-- when a specific feature is opened
-- when the app is idle or in a background-friendly maintenance window
-
-When suggesting deferral, specify:
-
-- what moves
-- why it is not needed before first frame
-- what state the UI shows before it completes
-- what event triggers it
-- how failure is handled
-- how the improvement will be measured
-
-Avoid relying on `DispatchQueue.main.async` as proof that work happens after first frame. It only moves work out of the current synchronous call stack. Use lifecycle points, explicit readiness signals, or measurement to confirm timing.
+* prove first-frame timing without measurement
+* assume `DispatchQueue.main.async` runs after the first displayed frame
+* know third-party SDK internal startup cost without traces, symbols, docs, or vendor guidance
+* decide that security, crash reporting, routing, compliance, or auth requirements can be deferred without product context
+* convert synchronous dependencies to async/lazy setup without checking call-site semantics
 
 ## Safe Patch Heuristics
 
@@ -423,44 +462,50 @@ When the agent is allowed to edit code, prefer small, reversible changes.
 
 Good patch candidates:
 
-- split a large startup method into named phases
-- move noncritical work behind an explicit method called after root UI setup
-- replace eager service construction with a factory when call sites already tolerate laziness
-- add a lightweight placeholder state for first screen data
-- delay feature module creation until route selection actually needs it
-- add app-owned phase markers around lifecycle and root UI construction
-- remove duplicate root UI setup when the correct lifecycle owner is clear
+* split a large startup method into named phases
+* isolate process bootstrap from scene UI creation
+* move clearly noncritical work behind an explicit post-root-UI method
+* replace eager service construction with factories when call sites already tolerate laziness
+* add a lightweight placeholder, locked, or loading state for the first screen
+* delay feature module creation until route selection actually needs it
+* add app-owned phase markers around lifecycle and root UI construction
+* remove duplicate root UI setup when the correct lifecycle owner is clear
+* make setup idempotent when scene creation can happen more than once
 
 Risky patch candidates requiring extra care:
 
-- changing authentication, security, crash reporting, payment, or compliance startup order
-- making a synchronous API async across many call sites
-- moving database migration or keychain logic without checking data correctness
-- changing deep-link routing order
-- changing multi-window behavior
-- replacing root navigation architecture
-- deferring feature flags or remote config when they gate visible behavior
+* changing authentication, privacy lock, security, crash reporting, payment, or compliance startup order
+* making a synchronous API async across many call sites
+* moving database migration or keychain logic without checking correctness
+* changing deep-link or notification routing order
+* changing multi-window behavior
+* replacing root navigation architecture
+* deferring feature flags or remote config when they gate visible behavior
+* changing background task registration timing
 
-If correctness is uncertain, recommend a minimal instrumentation or decomposition patch first, then a behavior-changing optimization after evidence is available.
+If correctness is uncertain, recommend instrumentation or decomposition first, then behavior-changing optimization after evidence is available.
 
 ## Review Checklist
 
-Use this checklist when reviewing lifecycle startup code.
+Use this checklist when reviewing UIKit lifecycle startup code.
 
-- [ ] Is the launch scenario known, or could this be resume/prewarmed/warm launch confusion?
-- [ ] Is app-wide bootstrap separated from scene-specific UI creation?
-- [ ] Does `didFinishLaunching` avoid broad synchronous initialization?
-- [ ] Does `scene(_:willConnectTo:options:)` create a minimal valid root UI?
-- [ ] Is root UI creation performed in one lifecycle owner, not duplicated?
-- [ ] Are launch options and deep links parsed cheaply before expensive route completion?
-- [ ] Are dependency containers registering factories instead of constructing the whole graph?
-- [ ] Are first-screen view models cheap to create?
-- [ ] Are database, keychain, file, parsing, and migration work absent from the first-frame critical path unless required?
-- [ ] Are background tasks scheduled with priority and correctness in mind rather than all started immediately?
-- [ ] Does every deferred task have a clear trigger and UI state before completion?
-- [ ] Is the recommendation connected to a launch phase and validation plan?
+* [ ] Is the scenario launch rather than resume, scene restoration, or warm/prewarmed confusion?
+* [ ] Is app-wide bootstrap separated from scene-specific UI creation?
+* [ ] Does the app delegate avoid broad synchronous initialization?
+* [ ] Does scene connection create a minimal valid root UI?
+* [ ] Is root UI creation owned by one lifecycle path, not duplicated?
+* [ ] Are launch options parsed cheaply before expensive route completion?
+* [ ] Are notification, URL, shortcut, and restoration inputs represented as pending intent when needed?
+* [ ] Are dependency containers registering lightweight factories instead of constructing the whole graph?
+* [ ] Are first-screen view models cheap to create?
+* [ ] Are database, keychain, file, parsing, migration, and network work absent from the first-frame path unless required?
+* [ ] Are required early services reduced to their minimal early mode?
+* [ ] Are multiple scenes handled without rerunning app-wide bootstrap?
+* [ ] Are background tasks scheduled with priority and correctness in mind?
+* [ ] Does every deferred task have a trigger, fallback UI, and failure behavior?
+* [ ] Is the recommendation connected to a launch phase and validation plan?
 
-## Output Guidance for This Reference
+## Output Guidance
 
 When this reference is used, report findings in this shape:
 
@@ -469,17 +514,19 @@ When this reference is used, report findings in this shape:
 AppDelegate / SceneDelegate / root UI / first frame / early responsiveness.
 
 ### Critical-path work
-List concrete calls or responsibilities that appear to block first frame or first interaction.
+Concrete calls or responsibilities that appear to block first frame or first interaction.
 
 ### Necessity classification
-Classify each task as first-frame, first-interaction, soon-after-launch, feature-lazy, or maintenance.
+First-frame / first-interaction / soon-after-launch / feature-lazy / maintenance.
 
 ### Recommended change
-Describe the smallest safe change and the deferral point or lazy boundary.
+Smallest safe change plus the deferral point or lazy boundary.
 
 ### Correctness risk
-Mention anything that may affect routing, auth, crash reporting, security, state restoration, or multi-window behavior.
+Routing, auth, privacy, crash reporting, security, state restoration, multi-window, background tasks, or compliance concerns.
 
 ### Validation
-Say what trace, signpost, launch metric, or manual comparison should improve.
+The trace, phase marker, launch metric, or manual comparison that should improve.
 ```
+
+Keep recommendations tied to evidence. If the code path or measurement boundary is unclear, label the finding as a hypothesis and ask for the missing trace, file, or launch scenario.
