@@ -1,7 +1,8 @@
 # iOS Performance Agent Skills
 
-<img width="732" height="718" alt="Image" src="https://github.com/user-attachments/assets/7d21a0e7-7bb9-4a51-ab1f-a49027610e3c" />
-
+<p align="center">
+  <img width="332" height="318" alt="Image" src="https://github.com/user-attachments/assets/7d21a0e7-7bb9-4a51-ab1f-a49027610e3c" />
+</p>
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
 Each skill lives under the `skills/` directory and can be copied manually into another agent setup if needed.
