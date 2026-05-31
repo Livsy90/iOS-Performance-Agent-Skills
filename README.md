@@ -2,7 +2,7 @@
 
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
-The repository was created with Codex-style skills in mind, but the structure is intentionally kept simple and portable. Each skill lives under the `skills/` directory and can be copied manually into another agent setup if needed.
+Each skill lives under the `skills/` directory and can be copied manually into another agent setup if needed.
 
 ## What this is
 
