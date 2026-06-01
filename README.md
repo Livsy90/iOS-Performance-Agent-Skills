@@ -1,7 +1,7 @@
 # iOS Performance Agent Skills
 
 <p align="center">
-  <img width="200" alt="Image" src="https://github.com/user-attachments/assets/a3f607af-dd18-49df-b24f-448d56322818" />
+  <img width="300" alt="Image" src="https://github.com/user-attachments/assets/4e1db19d-ef31-40a7-88fa-414e790fc2e0" />
 </p>
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
