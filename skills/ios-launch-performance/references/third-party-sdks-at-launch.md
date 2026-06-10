@@ -8,39 +8,62 @@ Keep this file focused on **SDK startup strategy**: which parts must run on the 
 
 This file covers:
 
-* whether a vendor SDK must start before first frame, before first interaction, or later
-* whether SDK startup can be split into lightweight setup and deferred work
-* SDK startup from `AppDelegate`, `SceneDelegate`, SwiftUI app entry points, dependency containers, bootstrap coordinators, and app-owned facades
-* analytics, crash reporting, ads, attribution, remote config, feature flags, experimentation, push, consent, security, fraud, logging, monitoring, diagnostics, and observability SDKs
-* launch-specific correctness risks caused by delaying or reordering a vendor SDK
-* vendor-supported lazy, deferred, offline, cached, minimal, manual-start, or background modes
-* hidden SDK startup through app-owned wrappers, dependency graph construction, root view/model creation, or automatic vendor behavior
-* how to review SDK initialization without guessing vendor semantics
+- whether a vendor SDK must start before first frame, before first interaction, or later
+- whether SDK startup can be split into lightweight setup and deferred work
+- SDK startup from `AppDelegate`, `SceneDelegate`, SwiftUI app entry points, dependency containers, bootstrap coordinators, and app-owned facades
+- analytics, crash reporting, ads, attribution, remote config, feature flags, experimentation, push, consent, security, fraud, logging, monitoring, diagnostics, and observability SDKs
+- launch-specific correctness risks caused by delaying or reordering a vendor SDK
+- vendor-supported lazy, deferred, offline, cached, minimal, manual-start, or background modes
+- hidden SDK startup caused by app-owned wrappers, dependency graph construction, root model creation, static access, or automatic vendor behavior
 
 This file does not cover:
 
-* dyld loading, Objective-C `+load`, constructors, runtime registration, or static initializer mechanics; use `pre-main-dyld-and-static-initializers.md`
-* static frameworks, dynamic frameworks, mergeable libraries, package manager layout, or binary inspection; use `linking-strategy.md`
-* general `UIApplicationDelegate`, `UISceneDelegate`, root window, first-screen routing, or main-thread launch work; use `appdelegate-scenedelegate-and-first-frame.md`
-* SwiftUI `@main App`, root view, observable state, `.task`, or `.onAppear` behavior; use `swiftui-app-launch.md`
-* launch taxonomy, cold/warm/prewarmed/resume classification, or first-frame target interpretation; use `launch-taxonomy-and-targets.md`
-* Instruments, XCTest, MetricKit, Organizer, signpost design, or CI baseline setup; use `metrics-instruments-xctest-metrickit.md`
-* general privacy, legal, compliance, or security architecture review unless the decision changes launch-time SDK startup
+- dyld, `+load`, constructor functions, or static initializer mechanics
+- static, dynamic, or mergeable linking strategy
+- UIKit root window, root view controller, or first-screen routing implementation
+- SwiftUI `@main App`, root view, `.task`, or `.onAppear` behavior except when it starts SDKs
+- launch taxonomy and measurement comparability
+- Instruments, XCTest, MetricKit, Organizer, signpost, or CI setup
+- general privacy, legal, compliance, or security architecture unless it directly affects launch-time SDK startup
+
+Use this file for SDK startup policy. If the issue becomes binary packaging, dynamic image count, pre-main hooks, app lifecycle structure, SwiftUI lifecycle, launch orchestration, or measurement tooling, route to the focused reference.
+
+## Contents
+
+- [Core Model](#core-model)
+- [Review Procedure](#review-procedure)
+- [Vendor Documentation Rule](#vendor-documentation-rule)
+- [What the Agent Can Inspect](#what-the-agent-can-inspect)
+- [Hidden Startup Triggers](#hidden-startup-triggers)
+- [SDK Startup Classification](#sdk-startup-classification)
+- [Category Guidance](#category-guidance)
+- [Analytics and Event Pipelines](#analytics-and-event-pipelines)
+- [Crash Reporting and Diagnostics](#crash-reporting-and-diagnostics)
+- [Ads and Monetization SDKs](#ads-and-monetization-sdks)
+- [Attribution, Install Tracking, and Deep Linking](#attribution-install-tracking-and-deep-linking)
+- [Remote Config](#remote-config)
+- [Feature Flags and Experimentation](#feature-flags-and-experimentation)
+- [Push Notifications](#push-notifications)
+- [Consent and Privacy-Gated SDKs](#consent-and-privacy-gated-sdks)
+- [Security, Fraud, and Integrity SDKs](#security-fraud-and-integrity-sdks)
+- [Logging, Monitoring, and Diagnostics](#logging-monitoring-and-diagnostics)
+- [Safe Patch Heuristics](#safe-patch-heuristics)
+- [Review Checklist](#review-checklist)
+- [Agent Guidance](#agent-guidance)
+- [Boundary With Other References](#boundary-with-other-references)
 
 ## Core Model
 
-Every SDK initialized on the launch path must answer one question:
+The central question is:
 
-```text
-What user-visible, diagnostic, security, routing, compliance, or correctness problem occurs if this SDK starts after first frame or after first interaction?
-```
+**What user-visible, diagnostic, security, routing, compliance, or correctness problem occurs if this SDK starts after first frame or after first interaction?**
 
 Avoid both extremes:
 
-* Do not assume every SDK can be delayed safely.
-* Do not assume a vendor recommendation to initialize during app launch means every part of that SDK must run synchronously before the first frame.
+- Do not assume every SDK can be delayed safely.
+- Do not assume a vendor instruction to "initialize at launch" means every part of the SDK must block first frame.
 
-Many SDK integrations can be split into phases:
+Many SDKs can be split into phases:
 
 ```text
 minimal local configuration
@@ -51,580 +74,716 @@ minimal local configuration
 → feature-specific module startup on first use
 ```
 
-The review goal is to keep only the truly launch-critical portion on the startup path and move the rest to explicit, measurable readiness points.
+The goal is not always to remove the SDK from launch. The goal is to keep only the truly launch-critical portion on the startup path and move the rest behind a clear readiness, feature, or background boundary.
 
-## Agent Inspection Procedure
+## Review Procedure
 
-When repository access is available, inspect real initialization sites instead of giving generic advice.
+When using this reference:
 
-### 1. Find startup and bootstrap code
+1. 1Find all SDK startup entry points.
+2. 2Inspect app-owned wrappers before vendor calls.
+3. 3Identify hidden startup triggers.
+4. 4Classify each SDK by startup necessity.
+5. 5Split each SDK into minimal critical setup and deferrable work.
+6. 6Check correctness risks: crash coverage, routing, consent, security, fraud, compliance, push, feature flags, diagnostics, and product requirements.
+7. 7Check whether vendor-supported lazy, deferred, manual-start, cached, offline, or minimal modes exist.
+8. 8Recommend the smallest safe change.
+9. 9Define validation for first frame, first interaction, SDK correctness, and production diagnostics.
 
-Search for app entry points, startup coordinators, and dependency setup:
+Do not recommend deferral until the SDK's launch responsibility is understood.
+
+## Vendor Documentation Rule
+
+Vendor documentation is a constraint, not the final launch design.
+
+Preserve:
+
+- required initialization order
+- supported startup modes
+- required delegates or handlers
+- privacy and consent requirements
+- crash or security coverage requirements
+- documented restrictions around lazy or manual startup
+
+Still separate:
+
+- minimal required setup
+- handler/delegate installation
+- cached/default state exposure
+- network refreshes
+- uploads
+- attribution sync
+- device scans
+- preloads
+- session enrichment
+- optional feature modules
+- maintenance work
+
+If vendor docs do not describe a safe deferred mode, do not invent one. Recommend measuring, isolating app-owned wrapper work, or consulting vendor documentation/support.
+
+## What the Agent Can Inspect
+
+When repository access is available, inspect app-owned startup surfaces and wrappers before blaming the vendor SDK itself.
+
+Search startup and bootstrap code:
 
 ```sh
 rg "didFinishLaunching|willFinishLaunching|configurationForConnecting|willConnectTo|@main|AppDelegate|SceneDelegate|Bootstrap|Startup|AppInitializer|Launch|DependencyContainer|ServiceLocator|Assembler|CompositionRoot" .
 ```
 
-### 2. Find SDK categories and wrappers
-
-Search for common vendor categories, product names, and app-owned abstractions:
+Search SDK categories and common wrappers:
 
 ```sh
 rg "Analytics|Crash|Crashlytics|Sentry|Bugsnag|Firebase|Amplitude|Mixpanel|AppsFlyer|Adjust|Branch|AdMob|GoogleMobileAds|RemoteConfig|FeatureFlag|Experiment|ABTest|Push|Notification|OneSignal|Security|Fraud|Jailbreak|Attestation|Monitoring|Logger|Telemetry|Consent|Tracking|SDKManager|ThirdParty" .
 ```
 
-### 3. Inspect dependency manifests
+Search wrapper-style startup methods:
 
-Check dependency manifests when they exist:
+```sh
+rg "configure\(|start\(|initialize\(|setup\(|register\(|activate\(|enable\(|track\(|identify\(|setUser|setDevice|setDelegate|setDataCollection" .
+```
 
-* `Package.swift`
-* `Package.resolved`
-* `Podfile`
-* `Podfile.lock`
-* `Cartfile`
-* `Cartfile.resolved`
-* Tuist, Bazel, Buck, or custom project generator manifests
-* vendored `.framework` and `.xcframework` directories
-* app target build settings and scripts that may start vendor setup indirectly
+Search hidden eager access:
 
-Do not turn this into a linking review. If the issue is package layout, dynamic framework count, binary size, or pre-main loading, switch to `linking-strategy.md` or `pre-main-dyld-and-static-initializers.md`.
+```sh
+rg "shared|singleton|default|static let|static var|lazy var|@StateObject|@Observable|ObservableObject|\.environment\(|\.task\s*\{|\.onAppear" .
+```
 
-### 4. Inspect app-owned wrappers first
+Search expensive work near SDK startup:
 
-Many codebases hide vendor startup behind app-owned names such as:
+```sh
+rg "Data\(|contentsOf:|FileManager|Keychain|SecItem|JSONDecoder|PropertyListDecoder|URLSession|upload|flush|sync|wait\(|semaphore|migrate|scan|preload|warm" .
+```
 
-* `AnalyticsService`
-* `CrashReporter`
-* `RemoteConfigProvider`
-* `FeatureFlagClient`
-* `PushNotificationService`
-* `AttributionService`
-* `SecurityProvider`
-* `FraudDetector`
-* `MonitoringClient`
-* `ConsentManager`
-* `SDKManager`
-* `ThirdPartyServices`
-* `AppBootstrapper`
+Search manifests and binary SDK ownership:
 
-Review what these wrappers actually do during construction and startup. A harmless-looking wrapper may synchronously initialize several vendors, read large local stores, access keychain, start network calls, register delegates, or create background queues.
+```sh
+rg "Firebase|Crashlytics|Sentry|Bugsnag|AppsFlyer|Adjust|Branch|AdMob|GoogleMobileAds|OneSignal|Amplitude|Mixpanel|RemoteConfig|xcframework|vendored_frameworks|binaryTarget|use_frameworks!" .
+```
 
-### 5. Check for hidden startup triggers
+Inspect manifests only to identify SDK ownership and startup surfaces. If the question becomes binary packaging, dynamic image count, static/dynamic linkage, or pre-main hooks, route to `linking-strategy.md` or `pre-main-dyld-and-static-initializers.md`.
 
-SDK work may start before the obvious `start()` or `configure()` call.
+Use search results as leads, not proof. Confirm whether the SDK starts before first frame, before first interaction, on resume, or only when a feature opens.
 
-Look for:
+The agent can:
 
-* eager singletons
-* globals or static properties touched during launch
-* dependency container registration that creates instances eagerly
-* property wrappers or lazy values accessed by the root screen
-* SwiftUI root view/model initializers that touch SDK services
-* automatic collection/session tracking enabled by default
-* Info.plist-driven or build-setting-driven vendor behavior
-* Objective-C categories, `+load`, constructor functions, or other load-time hooks
+- identify SDK startup entry points
+- identify app-owned wrappers that eagerly start vendors
+- classify SDK startup necessity
+- separate minimal required setup from deferrable work
+- detect duplicate SDK startup across lifecycle surfaces
+- recommend idempotency, phase splitting, lazy feature startup, or cached/default state
+- add signposts around app-owned SDK phases
+- ask for vendor documentation or production correctness requirements when needed
 
-If startup occurs through load-time hooks or static initialization, route that part of the investigation to `pre-main-dyld-and-static-initializers.md`.
+The agent cannot reliably:
+
+- change vendor SDK internals
+- invent unsupported lazy startup modes
+- delay crash/security/fraud/compliance startup without product review
+- decide privacy/legal requirements without product context
+- prove SDK launch cost without measurement
+- assume a vendor sample app represents the app's required startup policy
+
+## Hidden Startup Triggers
+
+SDK work may begin before an obvious `start()` or `configure()` call.
+
+Check for:
+
+- eager singletons
+- static/global access
+- dependency container registration that creates instances eagerly
+- app-owned facades whose initializer starts vendors
+- SwiftUI root view or root model initialization touching SDK services
+- UIKit lifecycle callbacks that call wrapper setup indirectly
+- automatic session tracking
+- automatic event collection
+- Info.plist or build-setting-driven vendor behavior
+- Objective-C categories, `+load`, constructors, or load-time hooks
+- notification, deep-link, or push delegates installed during launch
+- remote config or feature flag reads that trigger network refreshes
+- consent state reads that initialize tracking vendors
+
+If hidden startup is pre-main or load-time behavior, route to `pre-main-dyld-and-static-initializers.md`.
+
+If hidden startup is caused by eager dependency graph construction, route orchestration decisions to `launch-orchestration-and-dependency-graph.md`.
 
 ## SDK Startup Classification
 
-Classify each SDK or SDK wrapper before recommending deferral.
+Classify each SDK or wrapper before recommending changes.
 
 ### Launch-critical and synchronous
 
-Use this classification only when delaying initialization can break correctness, security, diagnostic coverage, launch routing, or mandatory compliance behavior.
+Use this classification when delaying the SDK would break a required launch-time property.
 
-Possible examples:
+Examples may include:
 
-* crash handler installation needed to capture startup crashes
-* security, fraud, or integrity gate required before showing sensitive content
-* deep link or notification router needed to choose the initial screen
-* local feature flag or kill-switch state required to choose the launch surface
-* notification categories or delegates required for launch-from-notification behavior
-* consent state required before any tracking SDK starts
-* mandatory regulatory or compliance gate that must precede visible content or tracking
+- crash handler installation when startup crash coverage is a product requirement
+- security, fraud, jailbreak, attestation, or integrity checks required before showing sensitive content
+- consent enforcement required before any tracking-capable SDK starts
+- deep-link routing required to show the correct first screen
+- privacy lock, authentication, or compliance gates that must run before visible content
 
-Even when this classification is justified, review whether the synchronous portion can be made smaller.
+Even then, look for a smaller launch-critical subset.
 
 ### Launch-critical but reducible
 
-Use this when the SDK must participate in launch but does not need its full workload immediately.
+Use this classification when the SDK must install a handler, expose cached state, or register a delegate early, but heavier work can move later.
 
-Typical strategy:
+Prefer:
 
-* install handlers or delegates early
-* configure keys and local options early
-* read only small cached state synchronously when required
-* expose safe defaults immediately
-* postpone uploads, session sync, network fetches, device scans, preloads, large file reads, and persistence maintenance
+- install handler/delegate early
+- configure keys and local options early
+- read only small cached state synchronously
+- expose safe defaults
+- postpone uploads
+- postpone network refresh
+- postpone session enrichment
+- postpone device scans
+- postpone preloading
+- postpone cleanup and maintenance
+
+This is the most common target for launch optimization.
 
 ### First-interaction required
 
-Use this when the SDK is needed before the first meaningful user action, but not before the first visible UI.
+Use this classification when the SDK does not need to block first frame but must be ready before the user performs the first meaningful action.
 
 Examples:
 
-* analytics event pipeline before the first tappable screen event
-* experiment assignment before a specific interaction
-* fraud or risk check before login, payment, transfer, or checkout
-* push permission flow before a notification onboarding step
-* monitoring required before an expensive user-initiated flow begins
+- feature flag needed before enabling a button
+- fraud check needed before money movement
+- remote config needed before showing a sensitive entry point
+- push registration needed before notification permission flow
+- logging/diagnostics required before a critical action
+
+The first frame may render a placeholder, disabled control, cached state, or loading state while the SDK becomes ready.
 
 ### Post-first-frame acceptable
 
-Use this when the SDK improves observability, personalization, monetization, diagnostics, or background readiness but is not needed for first frame.
+Use this classification when startup can happen shortly after the first visible UI without breaking correctness.
 
 Examples:
 
-* analytics session upload
-* remote config refresh when cached/default values exist
-* ad SDK initialization when the first screen has no ad slot
-* attribution sync when immediate routing does not depend on network attribution
-* noncritical monitoring setup
-* secondary logging sinks
-* previous log or crash upload
+- analytics upload
+- session enrichment
+- user property sync
+- noncritical monitoring setup
+- remote config refresh when cached defaults are available
+- event queue flush
+- diagnostics upload
+- attribution sync that does not affect initial routing
+
+Make sure post-first-frame work does not immediately block first interaction.
 
 ### Feature-specific and lazy
 
-Use this when the SDK is only needed after entering a specific feature.
+Use this classification when the SDK is only needed by a later feature.
 
 Examples:
 
-* ad mediation for an ad-supported screen
-* chat/support SDK for the help center
-* payment risk SDK for checkout or transfer
-* map/search/location vendor for a later tab
-* social login SDK for a specific login method
-* video, audio, scanning, or document-processing SDK for a later flow
+- ad mediation used only on ad-supported screens
+- chat/support SDK opened from a support screen
+- payment risk SDK used only during checkout
+- map/search/location SDK used only in a map flow
+- social login SDK used only when user chooses that provider
+- video, audio, scanner, document, or ML SDK used only inside a feature
+
+Move startup to the feature boundary and provide loading, failure, retry, and cancellation behavior there.
 
 ### Background-only or maintenance
 
-Use this when the work should not affect first frame or early interaction.
+Use this classification when the SDK work is useful but not required for first frame or first interaction.
 
 Examples:
 
-* cache pruning
-* log upload
-* pending analytics flush
-* remote config refresh that does not affect launch UI
-* ad preloading for later screens
-* token sync that can retry later
-* SDK health checks
-* old attachment cleanup
+- uploading cached logs
+- cleanup
+- diagnostics sync
+- session refresh
+- campaign sync
+- cache pruning
+- periodic health checks
+- optional monitoring enrichment
+
+Schedule after launch or in an appropriate background path.
 
 ## Category Guidance
 
-### Analytics and event pipelines
+Use the following category rules as defaults. Product requirements, vendor constraints, legal requirements, and measured evidence can override them.
+
+## Analytics and Event Pipelines
+
+Default stance:
 
 Analytics usually does not need full synchronous startup before first frame.
 
 Prefer:
 
-* cheap local event buffering through an app-owned facade
-* cached user/session identity when already available
-* nonblocking session start
-* upload/flush after visible UI or later
-* consent gating before tracking when required
-* no synchronous network call for user properties, experiments, attribution, or device metadata during launch
-* one early app-owned event buffer instead of several vendor SDKs starting independently
-
-Keep synchronous launch work only when the app must record a launch event before any possible crash or termination and the local write is cheap.
-
-Red flags:
-
-* analytics initialization performs network I/O before first frame
-* analytics reads large local stores synchronously
-* analytics blocks on consent, user profile, remote config, attribution, or experiment assignment
-* multiple analytics SDKs start separately instead of using a small app-owned buffer
-* event tracking from root view/model initialization forces vendor startup
-
-### Crash reporting and diagnostics
-
-Crash reporting can have a valid reason to install handlers early. That does not mean all crash SDK work must block launch.
-
-Prefer:
-
-* minimal handler installation early
-* deferred crash report upload
-* deferred symbol, attachment, breadcrumb, and log enrichment
-* bounded file reads for previous crash state
-* no synchronous network work during launch
-* no large log directory scan before first frame
-* one clear owner for crash and diagnostic setup
-
-Be careful before deferring the handler itself. If startup crashes matter, delaying handler installation may reduce diagnostic coverage.
+- cheap local event buffering
+- cached identity
+- nonblocking session start
+- deferred upload
+- deferred user property sync
+- consent-aware startup
+- event queue that can accept early events before network setup is complete
+- small facade that records launch events without starting the full vendor stack
 
 Red flags:
 
-* uploading previous crash reports synchronously during startup
-* scanning large log directories before first frame
-* attaching large device/app state snapshots immediately
-* starting multiple overlapping crash, logging, and monitoring SDKs without a clear ownership model
-* crash reporting setup hidden behind a broad `initializeAllSDKs` step
+- synchronous network request during launch
+- flushing old events before first frame
+- resolving user identity through keychain or network synchronously
+- loading large configuration before first screen
+- starting multiple analytics vendors through one wrapper without phase separation
+- broad device metadata collection before first frame
 
-### Ads and monetization SDKs
+Do not break:
 
-Ad SDKs are usually poor candidates for launch-critical synchronous initialization unless the first visible screen immediately contains an ad and the product explicitly accepts that trade-off.
+- consent rules
+- required internal audit events
+- launch attribution events if the product depends on them
+- event ordering when the app requires it
+
+## Crash Reporting and Diagnostics
+
+Default stance:
+
+Crash handler installation may need to be early. Crash upload, enrichment, and large diagnostics work usually do not.
 
 Prefer:
 
-* initialize after first visible UI when the first screen has no ad slot
-* initialize on first ad surface entry when possible
-* preload ads only after interaction-critical launch work is complete
-* respect consent and tracking authorization state before ad requests
-* keep mediation and network adapter startup out of the critical path
-* avoid starting all adapters when only one later surface needs ads
+- install the minimal crash handler early
+- configure release/environment keys early
+- defer upload of previous crash reports
+- defer log attachment collection
+- defer session enrichment
+- avoid synchronous disk scans
+- avoid heavy symbol or metadata work on launch
+- add a clear phase boundary between handler installation and upload/enrichment
 
 Red flags:
 
-* initializing ad mediation in launch lifecycle code when no ad appears on the first screen
-* loading or preloading ads before root UI is visible
-* blocking first frame on consent, tracking, or ad configuration fetch
-* initializing many ad network adapters unconditionally
-* starting ad SDKs before consent or tracking state is known
+- reading large logs before first frame
+- uploading crash reports synchronously
+- collecting device/app state synchronously
+- initializing multiple diagnostics SDKs through one blocking wrapper
+- blocking launch on previous crash processing
 
-### Attribution, install tracking, and deep linking
+Do not break:
 
-Attribution SDKs often combine routing and measurement. Do not treat them as one indivisible launch task.
+- startup crash coverage when it is a product requirement
+- privacy and consent constraints for diagnostics collection
+- required crash grouping metadata
+- release/environment configuration correctness
+
+## Ads and Monetization SDKs
+
+Default stance:
+
+Ads are usually poor candidates for launch-critical synchronous initialization unless the first visible screen contains an ad and the product explicitly accepts that trade-off.
 
 Prefer:
 
-* parse launch URL, universal link, or notification payload early when it determines the first screen
-* route with local payload data when possible
-* define fallback routing when network attribution is delayed or unavailable
-* defer attribution upload or campaign sync when it does not change immediate routing
-* use cached campaign/install state when safe
-* time-bound any attribution operation that can affect first-screen routing
+- start ad SDK at the first ad surface
+- preload only when the screen requires it
+- use feature-local loading state
+- keep mediation startup out of the global launch path
+- defer consent-dependent ad startup until consent state is known
+- separate ad SDK configuration from ad loading
 
 Red flags:
 
-* blocking root UI until a network attribution response returns
-* starting attribution only to upload install/session data before first frame
-* mixing deep-link routing with analytics upload in one synchronous startup call
-* no fallback when attribution is slow, offline, or unavailable
-* losing universal link or notification routing because the entire SDK was deferred
+- initializing ad mediation in `didFinishLaunching` for screens that do not show ads
+- loading ads before first frame
+- network preloads at launch
+- blocking first screen on ad readiness
+- starting multiple ad networks through global bootstrap
+- starting tracking-capable ad SDKs before consent state is valid
 
-### Remote config
+Do not break:
 
-Remote config should not make launch depend on the network unless the app has a strict correctness requirement.
+- consent and tracking requirements
+- first ad screen loading/fallback behavior
+- monetization reporting required by product decisions
+- vendor-supported initialization order
+
+## Attribution, Install Tracking, and Deep Linking
+
+Default stance:
+
+Deep-link routing and attribution upload are different responsibilities. Do not treat them as one indivisible launch task.
 
 Prefer:
 
-* safe local defaults
-* last-known-good cached config
-* an explicit minimal config subset needed for launch
-* bounded local reads
-* asynchronous refresh after first frame
-* staged activation of new config after the app is ready
-* separate local config read from remote refresh
-
-Launch-critical remote config should be rare and justified. If a value is required before first frame, prefer shipping a default in the app bundle or storing the last-known-good value locally.
+- parse launch URL, universal link, notification payload, or install payload early enough for routing
+- preserve payload for later attribution sync
+- use cached attribution state when possible
+- time-bound routing decisions
+- provide fallback routing when the attribution SDK is slow or unavailable
+- defer campaign upload or enrichment when it does not affect initial route
 
 Red flags:
 
-* waiting for remote config fetch before creating root UI
-* decoding a large config file synchronously on the main thread
-* coupling remote config refresh to dependency container construction
-* failing closed in a way that blocks launch for noncritical features
-* refreshing config only to update features that are not visible on the first screen
+- blocking first frame on attribution network calls
+- delaying initial routing while campaign metadata refreshes
+- losing payload when SDK startup is deferred
+- requiring attribution SDK readiness for every app-icon launch
+- mixing install tracking, deep-link routing, and analytics upload in one blocking setup call
 
-### Feature flags and experimentation
+Do not break:
 
-Feature flags can be launch-critical when they choose the initial app surface, enable a safety kill switch, or control a high-risk path. Most flag refresh work is not launch-critical.
+- initial deep-link routing
+- notification routing
+- install attribution data capture when product requires it
+- payload preservation across deferred startup
+- fraud or campaign validation rules if they gate initial content
+
+## Remote Config
+
+Default stance:
+
+Remote config should not make launch network-dependent unless the config controls launch safety, compliance, or initial surface correctness.
 
 Prefer:
 
-* local defaults compiled into the app
-* cached flag snapshots loaded cheaply
-* deterministic fallback behavior
-* separating read-only launch flag access from remote refresh
-* refreshing and activating new values after first frame or at a controlled readiness point
-* avoiding network waits on the launch path
-* keeping experiment assignment off the critical path unless it controls the first visible screen
+- local defaults
+- last-known-good cached config
+- minimal launch-critical config subset
+- async refresh after first frame
+- timeout and fallback behavior
+- explicit loading/disabled state for config-gated UI
+- separation between config read and config refresh
 
 Red flags:
 
-* remote flag fetch before root UI
-* JSON parsing of a large flag payload on the main thread
-* flag client initialization that transitively starts analytics, attribution, and remote config
-* hidden feature-flag reads that force SDK initialization during root view/model creation
-* no documented fallback when the flag service is unavailable
+- blocking first frame on remote config fetch
+- decoding large config synchronously at launch
+- refreshing all experiments before first screen
+- failing launch when config fetch fails
+- using remote config as a global dependency for root UI when only one feature needs it
 
-### Push notifications
+Do not break:
 
-Push support can have legitimate launch-time configuration requirements. Separate lightweight notification configuration from vendor network startup.
+- kill switches
+- safety gates
+- compliance gates
+- app-version compatibility checks
+- required initial-surface correctness
+- last-known-good fallback semantics
+
+## Feature Flags and Experimentation
+
+Default stance:
+
+Feature flags may be required for initial routing or first-screen layout, but full experiment sync usually should not block first frame.
 
 Prefer:
 
-* register notification categories and delegates at launch when required for actionable notifications or launch-time notification routing
-* parse notification launch payload early if it decides the initial route
-* defer token upload, vendor sync, topic subscription refresh, and marketing automation startup when not required for first frame
-* avoid prompting for notification permission during generic app launch unless the onboarding flow intentionally does so
-* preserve correct behavior for launches caused by tapping a notification
+- local default values
+- cached assignment
+- stable bucketing
+- minimal initial flag set
+- async refresh for noncritical flags
+- feature-owned flag loading where possible
+- explicit fallback for unknown flag state
 
 Red flags:
 
-* starting a full push marketing SDK synchronously only to upload a token
-* blocking first frame on token registration or vendor subscription sync
-* losing notification launch routing because push setup was deferred without a fallback
-* requesting notification permission before the UI explains the value
-* coupling push setup with analytics, attribution, or marketing SDK startup unnecessarily
+- fetching all flags synchronously at launch
+- recomputing all experiments before first frame
+- blocking first screen on noncritical experiment data
+- changing root navigation based on a value that may arrive late without fallback
+- forcing entire root environment to depend on a flag provider refresh
 
-### Security, fraud, attestation, and integrity SDKs
+Do not break:
 
-Security-related SDKs require more caution than analytics or ads. Some apps must gate sensitive content, payments, transfers, login, or regulated flows before allowing interaction.
+- assignment stability
+- experiment exposure logging rules
+- kill switches
+- compliance or safety flags
+- routing correctness for initial screen
+
+## Push Notifications
+
+Default stance:
+
+Push setup is often needed early enough for registration, permission flow, or notification routing, but not all push-related work must block first frame.
 
 Prefer:
 
-* minimal synchronous checks only for gates truly required before showing the first screen
-* cached or locally computed risk state when acceptable
-* asynchronous risk enrichment after first frame
-* feature-level checks before sensitive actions
-* explicit timeout and fallback behavior for network-based checks
-* clear product/security decision about fail-open vs fail-closed behavior
-* keeping non-sensitive launch UI independent from full risk enrichment when acceptable
-
-Do not defer security SDKs blindly. In high-risk apps, a small amount of launch-time security work may be correct. The performance review should narrow and bound the work, not remove the control.
+- preserve launch notification payload early
+- install notification delegates when needed
+- defer token upload if it is not required for first frame
+- defer subscription/topic sync
+- avoid blocking UI on permission or token refresh unless flow requires it
+- separate notification routing from push service maintenance
 
 Red flags:
 
-* network attestation blocking launch with no timeout
-* expensive device scan before showing any non-sensitive UI
-* security SDK initialized multiple times through different wrappers
-* unclear fallback when security service is slow or unavailable
-* large keychain or file-system scans on the main thread
-* security checks hidden inside unrelated startup services
+- uploading token synchronously before first frame
+- syncing topics at launch
+- blocking root UI on push registration
+- losing tapped-notification payload while deferring SDK startup
+- registering push SDK globally when push is only used after onboarding
 
-### Logging, monitoring, and observability
+Do not break:
 
-Observability is important, but launch should not be blocked by heavy logging infrastructure.
+- tapped notification routing
+- notification payload preservation
+- permission flow correctness
+- required delegate installation
+- token registration if the first flow depends on it
+
+## Consent and Privacy-Gated SDKs
+
+Default stance:
+
+Consent and privacy state can be launch-critical. Tracking-capable SDK startup must respect consent state.
 
 Prefer:
 
-* tiny in-memory or local buffered logging during early launch
-* deferred remote transport setup
-* deferred upload of previous logs
-* sampling where appropriate
-* avoiding synchronous persistence on the main thread
-* sharing environment/device metadata collection across observability tools when possible
+- cheap cached consent read
+- local consent defaults
+- minimal consent gate before tracking SDKs start
+- deferred vendor startup until consent allows it
+- explicit disabled state for tracking vendors
+- clear separation between consent check and vendor network work
 
 Red flags:
 
-* opening a large logging database before first frame
-* compressing or uploading logs during launch
-* initializing multiple monitoring SDKs with duplicate device/environment collection
-* blocking launch on logger flush or remote transport readiness
-* synchronous breadcrumb enrichment that scans large app state
+- starting analytics, ads, attribution, or tracking SDKs before consent state is known
+- blocking first frame on consent network refresh when cached state is valid
+- performing broad SDK setup before privacy gating
+- hiding vendor startup inside wrappers that bypass consent checks
 
-### Consent and privacy SDKs
+Do not break:
 
-Consent state may be required before analytics, ads, attribution, or tracking starts. That does not always mean a full consent SDK must block first frame.
+- legal/privacy requirements
+- consent persistence semantics
+- user opt-out behavior
+- SDK disabled mode when consent is denied
+- auditability of tracking startup
+
+## Security, Fraud, and Integrity SDKs
+
+Default stance:
+
+Security, fraud, jailbreak, attestation, and integrity SDKs may be launch-critical when the app must not show sensitive content until checks pass.
 
 Prefer:
 
-* cheap cached consent state for startup decisions
-* no tracking before consent when consent is required
-* showing consent UI as part of an explicit onboarding or privacy flow
-* deferred vendor startup until consent is known
-* separating consent read from vendor initialization
-* a clear ordering contract between consent, analytics, ads, and attribution
+- minimal early gate
+- cached risk state only if product/security policy allows it
+- timeout and degraded mode policy
+- explicit blocked/loading state
+- defer noncritical scans and uploads
+- feature-specific checks for feature-specific risk
+- clear separation between gate decision and telemetry upload
 
 Red flags:
 
-* starting tracking SDKs before consent is resolved
-* blocking launch on a network consent refresh when cached state is available
-* coupling consent SDK startup to unrelated SDK initialization
-* inconsistent ordering between consent, analytics, attribution, and ads
-* no fallback for missing or expired consent state
+- blocking all launches on long network attestation without fallback
+- showing sensitive UI before required checks pass
+- doing broad device scans before first frame when not required
+- mixing security gate, diagnostics upload, and analytics into one startup block
+- starting fraud SDK for users or features that do not need it yet
 
-## Vendor Initialization Strategy
+Do not break:
 
-Use this procedure when reviewing a vendor SDK on the launch path.
+- security policy
+- fraud-prevention requirements
+- compliance requirements
+- sensitive-content gating
+- payment or account-risk gates
+- audit and incident-response requirements
 
-### 1. Identify the entry point
+## Logging, Monitoring, and Diagnostics
 
-Find where the SDK is started and who calls it.
+Default stance:
 
-Look for:
-
-* direct calls from app/scene lifecycle methods
-* calls from a bootstrapper or dependency container
-* eager singleton construction
-* property wrappers or lazy globals touched during root UI creation
-* SwiftUI root model initialization that starts services
-* Objective-C categories or runtime hooks that register work implicitly
-* automatic vendor behavior enabled by configuration files or build settings
-
-If the SDK starts through `+load`, constructor functions, or static initializers, switch to `pre-main-dyld-and-static-initializers.md` for that part of the investigation.
-
-### 2. Split configuration from work
-
-For each SDK, separate:
-
-* local configuration
-* delegate/handler installation
-* cached state read
-* network request
-* upload/flush
-* device scan
-* database open or migration
-* keychain access
-* permission prompt
-* feature module preload
-* background maintenance
-
-Only keep the required subset before first frame.
-
-### 3. Check vendor-supported modes
-
-Look for official support for:
-
-* delayed initialization
-* manual start
-* offline mode
-* cached configuration
-* disable automatic session tracking
-* disable automatic event collection
-* disable automatic network upload during startup
-* lazy module loading
-* background upload
-* separate handler installation and transport startup
-* no-op or test mode for CI
-
-Do not invent unsupported initialization sequences for security, crash, payment, attribution, or compliance-sensitive SDKs without checking vendor documentation.
-
-### 4. Define the readiness point
-
-Replace vague delay rules with explicit readiness points.
-
-Good readiness points include:
-
-* after first visible UI is committed, verified by measurement
-* after first interaction-critical work is complete
-* after authentication state is known
-* after consent state is available
-* when a feature screen is entered
-* when network becomes available
-* when the app becomes active and has enough idle time for background startup
-
-Avoid arbitrary fixed delays as the only mechanism. A delay may hide the cost in one trace but still cause jank during early interaction.
-
-### 5. Preserve correctness contracts
-
-Before deferring an SDK, check whether it affects:
-
-* startup crash capture
-* notification or deep-link routing
-* security gating
-* consent and tracking order
-* compliance behavior
-* kill switches
-* initial screen selection
-* payment, login, transfer, or regulated flows
-* data integrity or migration safety
-
-If correctness depends on the SDK, reduce the launch-time work rather than blindly moving it later.
-
-### 6. Avoid the post-first-frame stampede
-
-Moving all SDKs after the first frame can create a new problem: CPU, I/O, network, lock, and main-thread contention immediately after the UI appears.
+Minimal logging/monitoring setup can be useful early. Heavy upload, enrichment, or historical processing usually should not block launch.
 
 Prefer:
 
-* staggered readiness points based on actual need
-* bounded concurrency
-* background QoS for maintenance work
-* cancellation or retry policies for noncritical startup
-* avoiding simultaneous large file reads, uploads, device scans, and JSON decoding
-* validating first interaction latency after deferral
+- lightweight local logger setup
+- in-memory buffering
+- async upload
+- deferred enrichment
+- bounded log file reads
+- small launch-specific diagnostics markers
+- stable signposts around SDK startup phases
 
-If deferral improves first draw but causes early interaction jank, the launch issue has been moved rather than solved.
+Red flags:
 
-### 7. Add measurement around app-owned wrappers
+- reading large log files before first frame
+- uploading logs synchronously
+- collecting broad device metadata during launch
+- starting multiple monitoring SDKs through one blocking wrapper
+- blocking first screen on diagnostics readiness
 
-When the app owns a wrapper such as `SDKManager.start()`, add app-level timing around each vendor startup step rather than measuring only the combined wrapper.
+Do not break:
 
-Prefer measuring:
+- minimum diagnostics needed for startup incidents
+- privacy and consent rules
+- required audit logging
+- crash/report correlation if product depends on it
 
-* time spent before first frame
-* main-thread time
-* synchronous file/keychain/database time
-* network requests started during launch
-* first interaction latency after deferral
-* whether deferred startup causes hitches shortly after launch
-* whether SDK work repeats across multiple wrappers
+## Safe Patch Heuristics
 
-Detailed tool setup belongs in `metrics-instruments-xctest-metrickit.md`.
+When the agent is allowed to edit code, prefer small, reversible changes.
 
-## Decision Rules
+Good patch candidates:
 
-* Do not use blanket rules such as “defer all SDKs” or “initialize all SDKs in launch lifecycle code.” Classify each SDK by launch correctness and user impact.
-* Keep the minimal launch-critical part early; move network, upload, preload, scan, refresh, and maintenance work later when safe.
-* Prefer cached/default state over launch-time network dependency.
-* Prefer app-owned facades that can buffer events, expose cached state, and initialize vendors lazily.
-* Do not block first frame on analytics, ads, attribution upload, log upload, remote config refresh, or noncritical experiment refresh unless the product explicitly accepts the trade-off.
-* Do not defer crash handler installation, notification routing, security gates, consent ordering, or first-screen feature flags without understanding the correctness impact.
-* Treat vendor SDK documentation as the source of truth for supported initialization modes.
-* Treat SDK initialization as launch-path work until measurement proves it does not affect first frame or early responsiveness.
-* Avoid starting SDKs from global/static initializers, Objective-C `+load`, constructors, dependency container construction, or root view/model initializers unless there is a strong reason.
-* If an SDK must start early, make that path small, deterministic, bounded, and visible in measurement.
-* Do not confuse “moved off the main thread” with “removed from launch impact.” Background work can still contend for CPU, I/O, locks, memory, and network.
-* When several SDKs depend on the same state, load that state once through an app-owned layer instead of letting every vendor scan or fetch it independently.
+- split `initializeAllSDKs()` into named SDK phases
+- keep crash handler installation early but defer upload and enrichment
+- replace direct vendor calls during launch with an app-owned buffer or facade
+- move analytics upload, session enrichment, or user property sync after first visible UI
+- move ad mediation startup to the first ad surface
+- use cached/default remote config for launch and refresh later
+- time-bound attribution or deep-link resolution and provide fallback routing
+- preserve deep-link or notification payload before deferring attribution or push SDK startup
+- move feature-only SDK startup to the feature entry point
+- add idempotency guards to SDK startup wrappers
+- add cancellation or timeout behavior to post-launch SDK work
+- add signposts around SDK startup phases
+- separate consent check from vendor network startup
 
-## Red Flags
+Risky patch candidates requiring extra care:
 
-Flag these during review:
+- delaying crash handler installation without diagnostic trade-off review
+- delaying consent, security, fraud, payment, privacy, or compliance gates without product/legal/security review
+- deferring deep-link or notification routing without fallback and payload preservation
+- moving SDK startup later when visible UI depends on SDK state but has no loading/failure mode
+- changing vendor-supported startup sequence without documentation
+- hiding SDK startup in async tasks that still compete with first interaction
+- replacing synchronous launch work with unbounded concurrent task fan-out
+- changing SDK startup ownership without idempotency
+- disabling SDK auto-start behavior without checking vendor constraints
+- changing binary packaging or linkage as a substitute for startup policy
 
-* one broad `initializeAllSDKs()` step called synchronously during launch with no per-SDK classification
-* vendor initialization hidden inside dependency container construction
-* SDK startup that performs synchronous network, keychain, file, database, or JSON parsing on the main thread
-* crash, analytics, logs, monitoring, and attribution all starting separate device/environment scans
-* ad mediation initialized before any ad surface exists
-* remote config or feature flag fetch blocking root UI
-* push token upload blocking first frame
-* notification or universal-link routing broken by deferring an SDK without another routing path
-* security SDK network check blocking launch without timeout or fallback
-* consent SDK and tracking SDKs initialized in the wrong order
-* SDK wrappers started from SwiftUI root view/model initialization
-* launch performance claims based only on “moved to async” without trace evidence
-* a post-first-frame burst where all deferred SDKs start at once and cause first interaction jank
-* vendor startup repeated through multiple wrappers or feature modules
-* no documented owner for launch-critical SDK ordering
+If correctness is uncertain, recommend measurement, product review, vendor documentation, or a smaller phase split before behavior-changing edits.
 
-## Recommended Review Output
+## Review Checklist
 
-When this reference is used, return SDK-specific findings instead of generic launch advice.
+Use this checklist when reviewing third-party SDK startup on the launch path.
 
-Use this structure:
+- [ ] Are all SDK startup entry points identified?
+- [ ] Are app-owned wrappers inspected before blaming the vendor SDK?
+- [ ] Are hidden startup triggers identified?
+- [ ] Is each SDK classified by launch necessity?
+- [ ] Is minimal required setup separated from deferrable work?
+- [ ] Are crash, consent, security, fraud, deep-link, push, feature flag, and remote config correctness risks preserved?
+- [ ] Are vendor-supported startup modes checked?
+- [ ] Are network calls, uploads, scans, preloads, and enrichment kept off the first-frame path unless required?
+- [ ] Are feature-specific SDKs started at feature boundaries?
+- [ ] Are duplicate SDK startups avoided across AppDelegate, SceneDelegate, SwiftUI App, root models, `.task`, `.onAppear`, and dependency containers?
+- [ ] Are SDK startup wrappers idempotent?
+- [ ] Are async deferrals bounded and cancellable where appropriate?
+- [ ] Are loading, failure, fallback, and degraded states defined?
+- [ ] Are signposts or measurements available to validate improvement?
+- [ ] Is the recommendation tied to first-frame, first-interaction, and SDK correctness validation?
+
+## Agent Guidance
+
+When applying this reference, produce an SDK startup-oriented review:
 
 ```markdown
-### SDK launch classification
+### SDK startup surface
+List where SDK startup occurs: AppDelegate, SceneDelegate, SwiftUI App, root model, dependency container, wrapper, `.task`, `.onAppear`, hidden static access, or vendor auto-start.
 
-- SDK or wrapper:
-- Current startup point:
-- Required before first frame: yes/no/unknown
-- Required before first interaction: yes/no/unknown
-- Correctness risk if deferred:
-- Main launch cost suspicion:
+### SDK classification
+Classify each SDK as launch-critical synchronous, launch-critical but reducible, first-interaction required, post-first-frame acceptable, feature-specific/lazy, or background/maintenance.
 
-### Recommendation
+### Minimal required setup
+Describe the smallest setup that must remain early.
 
-- Keep early:
-- Move later:
-- Make lazy:
-- Replace with cached/default state:
-- Vendor documentation to verify:
+### Deferrable work
+List uploads, network refreshes, enrichment, scans, preloads, cleanup, feature modules, or sync work that can move later.
+
+### Correctness risks
+Call out crash coverage, consent, privacy, routing, attribution, push, security, fraud, compliance, diagnostics, kill switches, or experiment assignment concerns.
+
+### Recommended change
+Suggest the smallest safe phase split, lazy startup, facade, idempotency guard, timeout, fallback, or measurement change.
 
 ### Validation
-
-- Local trace area to inspect:
-- App-level signpost or timing to add:
-- Production metric or regression check:
-- Risk to retest after deferral:
+Explain how to verify first frame, first interaction, SDK behavior, diagnostics, and production correctness after the change.
 ```
 
-If the answer depends on unavailable vendor documentation, say so clearly and recommend the safest classification rather than guessing.
+Keep SDK recommendations tied to correctness. Do not recommend deferral only because an SDK is third-party.
 
-## Non-Goals
+## Boundary With Other References
 
-Do not turn this reference into a generic SDK integration guide. The only question here is how vendor startup affects app launch and early responsiveness.
+Use this reference for third-party SDK startup policy and app-owned SDK wrapper behavior.
+
+Read `references/launch-taxonomy-and-targets.md` when the issue involves:
+
+- cold, warm, prewarmed, resume, first install, or update launch terminology
+- launch target selection
+- measurement scenario classification
+- whether two numbers are comparable
+
+Read `references/pre-main-dyld-and-static-initializers.md` when the issue involves:
+
+- SDK behavior from `+load`
+- constructor functions
+- ObjC categories
+- static initializer mechanics
+- load-time hooks before app lifecycle code
+
+Read `references/linking-strategy.md` when the issue involves:
+
+- vendored SDK packaging
+- dynamic frameworks
+- static libraries
+- mergeable libraries
+- modularization and launch-time linking trade-offs
+- binary layout
+- order-file considerations
+
+Read `references/launch-orchestration-and-dependency-graph.md` when the issue involves:
+
+- SDK startup as part of a larger startup graph
+- critical path analysis
+- startup step dependencies
+- hidden ordering
+- safe parallelism
+- failure policy
+- dependency-chain optimization
+
+Read `references/appdelegate-scenedelegate-and-first-frame.md` when the issue involves:
+
+- `UIApplicationDelegate`
+- `UISceneDelegate`
+- lifecycle callback implementation
+- window setup
+- root view controller creation
+- first-frame readiness
+- main-thread lifecycle work
+
+Read `references/swiftui-app-launch.md` when the issue involves:
+
+- SwiftUI `App`
+- `WindowGroup`
+- root view setup
+- observable state
+- `.task`
+- `.onAppear`
+- `scenePhase`
+- `@UIApplicationDelegateAdaptor`
+- environment initialization
+
+Read `references/metrics-instruments-xctest-metrickit.md` when the issue involves:
+
+- Instruments
+- Time Profiler
+- signposts
+- XCTest launch metrics
+- MetricKit
+- Xcode Organizer
+- CI baselines
+- production monitoring
+
+Do not read all references by default.
