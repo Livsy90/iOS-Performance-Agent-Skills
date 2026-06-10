@@ -2,11 +2,74 @@
 
 Use this reference when launch work has grown into many ordered startup tasks, fragile initialization sequences, unsafe parallelism, or unclear readiness rules.
 
-This file is about organizing post-entry launch work. It should not explain launch taxonomy, dyld internals, framework linking strategy, tool setup, MetricKit APIs, or XCTest configuration. Use the other references for those topics.
+This file is about organizing post-entry launch work. It should not explain launch taxonomy, dyld internals, framework linking strategy, SDK startup policy, tool setup, MetricKit APIs, XCTest configuration, or Instruments workflow. Use the other references for those topics.
+
+## When to Use This Reference
+
+Use this reference when reviewing:
+
+- a long `AppDelegate`, `SceneDelegate`, SwiftUI `App`, or launch coordinator
+- a startup sequence with many services, stores, routers, feature gates, or SDKs
+- launch work protected by comments such as "do not reorder"
+- an attempted parallel launch implementation
+- startup crashes caused by reordered initialization
+- launch work that blocks first frame or first interaction
+- a slow first screen caused by full app-wide setup
+- a launch system with unclear readiness, timeout, or failure rules
+- a proposal to move startup work to background queues, tasks, workers, or task groups
+
+Do not use this reference only because launch is slow. First decide whether the problem is orchestration, dyld/pre-main, linking, AppDelegate/SceneDelegate work, SwiftUI root setup, SDK policy, first-frame rendering, or measurement setup.
+
+## Scope Boundary
+
+This reference answers:
+
+- how startup work should be organized
+- which steps are truly launch-critical
+- which dependencies are hidden by serial ordering
+- whether parallelism is safe
+- which chain determines the minimum possible launch time
+- whether the app can show useful UI before full readiness
+- how failure, timeout, cancellation, and partial readiness should be modeled
+
+This reference does not answer:
+
+- cold launch vs warm launch terminology
+- dyld, pre-main, static initialization, or `+load`
+- static vs dynamic vs mergeable linking strategy
+- detailed SDK startup policy
+- UIKit lifecycle ownership
+- SwiftUI `App` lifecycle details
+- MetricKit, XCTest, Organizer, or Instruments setup
+
+Route to the corresponding reference when those details are the core issue.
+
+## Contents
+
+- [Purpose](#purpose)
+- [Core Model](#core-model)
+- [Review Procedure](#review-procedure)
+- [Critical Path vs Secondary Path](#critical-path-vs-secondary-path)
+- [Dependency Graph](#dependency-graph)
+- [Dependency Types](#dependency-types)
+- [Scheduling Policy](#scheduling-policy)
+- [Bounded Parallelism](#bounded-parallelism)
+- [Main-Thread Blocking Risks](#main-thread-blocking-risks)
+- [Race Conditions and Ordering Bugs](#race-conditions-and-ordering-bugs)
+- [Cycle Detection](#cycle-detection)
+- [Longest Dependency Chain](#longest-dependency-chain)
+- [Partial Readiness](#partial-readiness)
+- [Failure, Cancellation, and Timeout Policy](#failure-cancellation-and-timeout-policy)
+- [Observability](#observability)
+- [What the Agent Can Inspect](#what-the-agent-can-inspect)
+- [Safe Patch Heuristics](#safe-patch-heuristics)
+- [Review Checklist](#review-checklist)
+- [Agent Guidance](#agent-guidance)
+- [Boundary With Other References](#boundary-with-other-references)
 
 ## Purpose
 
-Large iOS apps often accumulate launch work over time. What starts as a few setup calls can become a long sequence of services, SDKs, stores, routers, feature gates, session checks, and initial screen dependencies.
+Large iOS apps often accumulate launch work over time. What starts as a few setup calls can become a long sequence of services, SDKs, stores, routers, feature gates, session checks, and first-screen dependencies.
 
 When that sequence is stored only as ordered code, comments, or team memory, it becomes hard to optimize safely. Engineers may know that one step must run before another, but the dependency is not represented anywhere the app can validate.
 
@@ -20,25 +83,11 @@ startup work
 → measurable readiness
 ```
 
-## When to Use This Reference
-
-Use this reference when reviewing:
-
-- a long `AppDelegate`, `SceneDelegate`, SwiftUI `App`, or launch coordinator
-- a startup sequence with many services or SDKs
-- launch work currently protected by comments such as "do not reorder"
-- an attempted parallel launch implementation
-- startup crashes caused by reordered initialization
-- launch work that blocks first frame or first interaction
-- a slow first screen caused by full app-wide setup
-- a launch system with unclear failure handling
-- a proposal to move startup work to background queues, tasks, or workers
-
-Do not use this reference only because launch is slow. First decide whether the problem is orchestration, dyld/pre-main, linking, first-frame rendering, SDK policy, or measurement setup.
+The key output is not a new abstraction. The key output is clarity: which work is truly launch-critical, which work is merely early, and which work is historical baggage.
 
 ## Core Model
 
-Model launch work as a set of steps. Each step should have a reason to exist on the launch path.
+Model launch work as a set of named steps. Each step should have a reason to exist on the launch path.
 
 For each step, identify:
 
@@ -54,7 +103,24 @@ For each step, identify:
 - how failure should affect app readiness
 - how long it takes in representative measurements
 
-The key output is not a new abstraction. The key output is clarity: which work is truly launch-critical, which work is merely early, and which work is historical baggage.
+Do not preserve a launch step only because it has always been there.
+
+## Review Procedure
+
+When using this reference:
+
+1. Identify the current startup sequence.
+2. Convert ordered calls into named launch steps.
+3. Classify each step as critical, secondary, lazy, or maintenance.
+4. Identify dependencies between steps.
+5. Mark main-thread, shared-state, side-effect, failure, timeout, and cancellation constraints.
+6. Find the longest required dependency chain.
+7. Look for work that can move out of global launch.
+8. Decide whether parallelism is safe, useful, and bounded.
+9. Recommend the smallest safe change.
+10. Define validation for both correctness and timing.
+
+Avoid generic advice such as "run this in parallel" or "move this to a background queue" unless dependencies and readiness rules are explicit.
 
 ## Critical Path vs Secondary Path
 
@@ -67,7 +133,7 @@ A step belongs to the critical path only when the app cannot produce a valid fir
 Typical critical-path candidates:
 
 - deciding the initial route
-- loading minimal session state
+- loading minimal local session state
 - preparing safety or correctness checks required before UI
 - installing crash handling when required by product policy
 - preparing the smallest state needed by the first visible screen
@@ -101,7 +167,22 @@ Prefer lazy setup when:
 - setup can be hidden behind the feature's own loading state
 - partial app readiness is acceptable
 
-Lazy setup is not a free optimization. It moves cost to a later interaction, so the feature must own its loading, failure, cancellation, and retry behavior.
+Lazy setup is not free. It moves cost to a later interaction, so the feature must own loading, failure, cancellation, and retry behavior.
+
+### Maintenance Path
+
+A step belongs to the maintenance path when it supports long-term app health but does not affect launch readiness.
+
+Common maintenance candidates:
+
+- old cache cleanup
+- log trimming
+- optional prefetching
+- analytics upload
+- stale local data reconciliation
+- feature warmups not required by the initial route
+
+Maintenance work should not run at launch by default unless there is a clear product, compliance, or correctness reason.
 
 ## Dependency Graph
 
@@ -119,7 +200,7 @@ A launch step should not depend on another step because of ordering habit. It sh
 
 ## Dependency Types
 
-Classify dependencies before scheduling work.
+Use this taxonomy when converting an ordered startup list into an explicit launch graph.
 
 ### Data Dependency
 
@@ -140,6 +221,7 @@ Review questions:
 - Which configuration is required for the first screen?
 - Which configuration can be updated after launch?
 - Can defaults unblock first frame safely?
+- What visible behavior changes if defaults are later replaced?
 
 ### Registration Dependency
 
@@ -150,6 +232,7 @@ Review questions:
 - Is registration required globally or only for a feature?
 - Can registration move closer to feature activation?
 - Is registration idempotent?
+- What early event would be missed if registration moves later?
 
 ### Main-Thread Dependency
 
@@ -181,6 +264,7 @@ Review questions:
 - Should failure degrade the first screen?
 - Should failure trigger retry in the background?
 - Should failure be surfaced to the user?
+- Which failure mode should be measured or logged?
 
 ## Scheduling Policy
 
@@ -193,6 +277,7 @@ A safe scheduler should respect:
 - main-thread requirements
 - resource limits
 - cancellation
+- timeout
 - failure policy
 - duplicate prevention
 - deterministic readiness gates
@@ -225,6 +310,7 @@ This pattern can improve a benchmark in some cases but carries several risks:
 - old devices have fewer cores to compensate for the blocked main thread
 - a slow background step can still delay the whole launch
 - error handling often becomes harder to reason about
+- cancellation and timeout behavior can become unclear
 
 If the app must wait before showing UI, keep the waiting boundary minimal and explicit. Prefer showing a small valid UI while secondary readiness continues when product behavior allows it.
 
@@ -285,6 +371,7 @@ Useful readiness levels:
 - app can show cached or placeholder first-screen content
 - app can respond to basic navigation
 - app can complete the first intended interaction
+- all launch-critical services are ready
 - all feature modules are ready
 - background maintenance is complete
 
@@ -292,9 +379,9 @@ Partial readiness requires explicit product behavior. The UI must know what is a
 
 Do not hide incomplete readiness behind a UI that appears interactive but blocks or fails on first touch.
 
-## Failure Policy
+## Failure, Cancellation, and Timeout Policy
 
-Each launch step should define how failure affects startup.
+Launch work should not assume unlimited time or perfect success.
 
 Classify failures as:
 
@@ -305,21 +392,18 @@ Classify failures as:
 - retryable in the background
 - feature-local and not launch-blocking
 
-A launch orchestrator without failure policy often becomes either too fragile or too permissive. It may crash for recoverable issues or silently continue after a critical invariant is broken.
-
-## Cancellation and Timeout Policy
-
-Launch work should not assume unlimited time.
-
-Review whether steps need:
+Review whether launch steps need:
 
 - cancellation when the app moves to background
 - timeout when waiting for network, disk, or another subsystem
 - retry with backoff
 - fallback state
 - telemetry for timeout and degraded readiness
+- a user-visible degraded state
 
 Avoid making first frame depend on open-ended network or server behavior.
+
+A launch orchestrator without failure policy often becomes either too fragile or too permissive. It may crash for recoverable issues or silently continue after a critical invariant is broken.
 
 ## Observability
 
@@ -330,35 +414,123 @@ For each significant step or group, collect enough information to answer:
 - when it became eligible to run
 - when it started
 - when it finished
-- whether it ran on the main thread or background executor
+- whether it ran on the main thread, main actor, or background executor
 - whether it waited on dependencies
 - whether it failed, timed out, or degraded
 - which readiness level it unlocked
 
-Prefer signposts or structured startup events over ad hoc print statements. The goal is to reconstruct the launch timeline and the dependency chain during local profiling and production regression analysis.
+Prefer signposts or structured startup events over ad hoc print statements. The goal is to reconstruct the launch timeline and dependency chain during local profiling and production regression analysis.
 
-Tool-specific guidance belongs in `metrics-instruments-xctest-metrickit.md`.
+Keep this section focused on what orchestration should expose. For how to collect, visualize, or compare these events, use `metrics-instruments-xctest-metrickit.md`.
+
+## What the Agent Can Inspect
+
+When repository access is available, inspect concrete launch orchestration code instead of giving generic advice.
+
+Search for launch coordinators and bootstrap systems:
+
+```sh
+rg "LaunchCoordinator|Startup|Bootstrap|Orchestrator|Readiness|AppReady|initialize|configure|start|register|resolve|prepare" .
+```
+
+Search for ordered startup comments and implicit dependencies:
+
+```sh
+rg "do not reorder|must run before|must be called before|depends on|after .* initialized|ready|readiness|bootstrap complete|startup complete" .
+```
+
+Search for parallelism and blocking waits:
+
+```sh
+rg "TaskGroup|async let|DispatchGroup|OperationQueue|Task\.detached|semaphore|wait\(|sync\(|DispatchQueue\.main\.sync|performAndWait" .
+```
+
+Search for broad dependency graph construction:
+
+```sh
+rg "registerAll|resolveAll|buildContainer|assemble|container\.register|container\.resolve|make.*Graph|create.*Graph|dependency graph" .
+```
+
+Search for first-screen coupling to app-wide readiness:
+
+```sh
+rg "isReady|appReady|startupFinished|bootstrapFinished|showMain|initialRoute|rootViewController|WindowGroup|UIHostingController" .
+```
+
+Use search results as leads, not proof. Confirm whether matched code actually runs before first frame or first interaction.
+
+The agent can:
+
+- convert a serial startup list into named steps
+- classify each step by readiness requirement
+- identify hidden dependencies implied by ordering
+- detect unsafe or unbounded parallelism
+- suggest explicit readiness states
+- propose lazy or feature-owned setup for noncritical work
+- recommend instrumentation around launch steps
+- propose small local patches when correctness is clear
+
+The agent cannot reliably:
+
+- prove performance improvement without measurement
+- decide product readiness rules without context
+- defer auth, security, privacy, crash reporting, routing, or compliance work without checking correctness
+- parallelize startup safely without dependency and failure analysis
+- treat a passing local run as proof that ordering is safe
+
+## Safe Patch Heuristics
+
+When the agent is allowed to edit code, prefer small, reversible changes.
+
+Good patch candidates:
+
+- split a large serial startup method into named phases
+- extract explicit readiness states
+- replace comment-based ordering with named dependencies
+- add idempotency guards around startup steps
+- move clearly feature-specific setup behind feature activation
+- defer noncritical secondary work behind an explicit post-first-frame or post-first-interaction trigger
+- replace eager dependency construction with factories when call sites already tolerate laziness
+- add bounded task groups only after dependencies are explicit
+- add signposts or structured startup events around named steps
+- add fallback or degraded states for partial readiness
+
+Risky patch candidates requiring extra care:
+
+- changing authentication, privacy, security, crash reporting, payment, or compliance startup order
+- converting a serial startup sequence into parallel work without dependency audit
+- changing deep-link, push, shortcut, or restoration readiness
+- changing database migration or keychain ordering
+- making launch show UI before required privacy/session state is known
+- introducing lazy setup when the first feature access has no loading or failure state
+- changing startup behavior across multiple scenes or windows
+- hiding work behind background queues without reducing contention or improving readiness
+
+If correctness is uncertain, recommend instrumentation or decomposition first, then behavior-changing optimization after evidence is available.
 
 ## Review Checklist
 
 When reviewing a launch orchestration system, check:
 
-- Are launch steps named by responsibility rather than implementation detail?
-- Does each step declare why it belongs on the launch path?
-- Are dependencies explicit and minimal?
-- Are main-thread requirements explicit?
-- Are side effects documented as readiness conditions?
-- Are failure, timeout, and retry rules defined?
-- Can independent work run without blocking first frame?
-- Is parallelism bounded?
-- Are cycles impossible or detected?
-- Is the longest dependency chain visible in measurement?
-- Can the first screen render with partial readiness?
-- Can later features own their own setup instead of forcing global launch work?
+- [ ] Is the startup sequence represented as named steps rather than one anonymous list?
+- [ ] Does each step declare why it belongs on the launch path?
+- [ ] Is each step classified as critical, secondary, lazy, or maintenance?
+- [ ] Are dependencies explicit and minimal?
+- [ ] Are main-thread requirements explicit?
+- [ ] Are side effects documented as readiness conditions?
+- [ ] Are failure, timeout, retry, and cancellation rules defined?
+- [ ] Can independent work run without blocking first frame?
+- [ ] Is parallelism bounded?
+- [ ] Are cycles impossible or detected?
+- [ ] Is the longest dependency chain visible in measurement?
+- [ ] Can the first screen render with partial readiness?
+- [ ] Can later features own their own setup instead of forcing global launch work?
+- [ ] Are deferred tasks attached to explicit triggers and fallback states?
+- [ ] Is the recommendation connected to correctness validation and timing validation?
 
 ## Agent Guidance
 
-When applying this reference, avoid generic advice such as "run it in parallel" or "move it to a background queue." Instead, produce a graph-oriented review:
+When applying this reference, produce a graph-oriented review:
 
 ```markdown
 ### Launch graph assessment
@@ -368,13 +540,19 @@ Describe whether startup is serial, partially parallel, dependency-driven, or un
 Name the work that appears required before first frame or first interaction.
 
 ### Hidden dependencies
-List dependencies currently implied by ordering, shared state, or side effects.
+List dependencies currently implied by ordering, shared state, side effects, or comments.
 
 ### Parallelism safety
 Explain what can run independently and what must remain ordered.
 
 ### Longest chain
 Identify the chain most likely to determine launch duration.
+
+### Partial readiness
+Explain whether the app can show a useful first screen before full readiness.
+
+### Correctness risks
+Call out auth, routing, privacy, security, crash reporting, state restoration, multi-window, database, keychain, or compliance concerns.
 
 ### Recommended changes
 Suggest changes that reduce launch-critical work, make dependencies explicit, or move feature-specific work out of global startup.
@@ -383,23 +561,80 @@ Suggest changes that reduce launch-critical work, make dependencies explicit, or
 Explain how to verify correctness and performance after changing orchestration.
 ```
 
+Keep recommendations tied to evidence. If the code path or measurement boundary is unclear, label the finding as a hypothesis.
+
 ## Boundary With Other References
 
-This reference should answer:
+Use this reference for launch orchestration and dependency graph design.
 
-- How should startup work be organized?
-- Which steps are truly critical?
-- Which dependencies are hidden?
-- Is parallelism safe?
-- What is the longest launch dependency chain?
-- Can the app show a useful first screen before full readiness?
+Read `references/launch-taxonomy-and-targets.md` when the issue involves:
 
-This reference should not answer:
+- cold, warm, prewarmed, resume, first install, or update launch terminology
+- launch target selection
+- measurement scenario classification
 
-- What is cold launch vs warm launch?
-- What happens in dyld before `main`?
-- Should a module be static, dynamic, or mergeable?
-- Which SDKs should start before first frame?
-- How should `XCTApplicationLaunchMetric` be configured?
-- How should MetricKit histograms be interpreted?
-- How should the Instruments App Launch template be used?
+Read `references/pre-main-dyld-and-static-initializers.md` when the issue involves:
+
+- dyld
+- pre-main work
+- `+load`
+- `+initialize`
+- constructor functions
+- Objective-C categories
+- runtime registration
+- static initialization
+
+Read `references/linking-strategy.md` when the issue involves:
+
+- dynamic frameworks
+- static libraries
+- mergeable libraries
+- modularization and launch-time linking trade-offs
+- binary layout
+- order-file considerations
+
+Read `references/appdelegate-scenedelegate-and-first-frame.md` when the issue involves:
+
+- `UIApplicationDelegate`
+- `UISceneDelegate`
+- window setup
+- root view controller creation
+- first-frame readiness
+- main-thread lifecycle work
+
+Read `references/swiftui-app-launch.md` when the issue involves:
+
+- SwiftUI `App`
+- `WindowGroup`
+- root view setup
+- observable state
+- `.task`
+- `.onAppear`
+- `scenePhase`
+- `@UIApplicationDelegateAdaptor`
+- environment initialization
+
+Read `references/third-party-sdks-at-launch.md` when the issue involves:
+
+- analytics
+- crash reporting
+- ads
+- attribution
+- remote config
+- push
+- feature flags
+- security SDKs
+- vendor initialization strategy
+
+Read `references/metrics-instruments-xctest-metrickit.md` when the issue involves:
+
+- Instruments
+- Time Profiler
+- signposts
+- XCTest launch metrics
+- MetricKit
+- Xcode Organizer
+- CI baselines
+- production monitoring
+
+Do not read all references by default.
