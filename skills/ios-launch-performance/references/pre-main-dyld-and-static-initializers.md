@@ -2,10 +2,10 @@
 
 Use this reference when a launch investigation points to work that happens before the app reaches its own application lifecycle code, or when reviewing code that may execute while executable images are loaded, linked, and registered.
 
-Keep this file focused on **pre-main and load-time behavior**. Do not use it as the primary guide for framework linking strategy, AppDelegate/SceneDelegate startup, SwiftUI root initialization, third-party SDK policy, launch orchestration, or measurement setup. Those topics belong in their own reference files.
+Keep this file focused on **pre-main and load-time behavior**. Do not use it as the primary guide for framework linking strategy, AppDelegate/SceneDelegate startup, SwiftUI root initialization, third-party SDK policy, launch orchestration, or measurement setup.
 
 ## Scope Boundary
-
+ф
 This file covers:
 
 - what pre-main means in an iOS launch investigation
@@ -15,6 +15,7 @@ This file covers:
 - binary initializer sections such as `__mod_init_func`
 - Objective-C categories and runtime registration risk
 - Swift global/static initialization when it is touched during launch
+- dynamic loading during startup when it behaves like launch-time image work
 - how to review code or binaries suspected of load-time work
 
 This file does not cover:
@@ -23,279 +24,272 @@ This file does not cover:
 - how to restructure `didFinishLaunching` or `scene(_:willConnectTo:)`
 - how to defer third-party SDK startup
 - how to configure XCTest, MetricKit, Organizer, or CI launch tests
-- how to build a launch dependency graph or launch orchestrator
+- how to design a launch dependency graph
+- how to restructure SwiftUI root view setup
+
+Use this file to diagnose initializer content and load-time behavior. Use `linking-strategy.md` to decide whether an image should be a separate launch-loaded dependency at all.
+
+## Contents
+
+- [Mental Model](#mental-model)
+- [Why This Phase Matters](#why-this-phase-matters)
+- [Review Procedure](#review-procedure)
+- [What Counts as Pre-main Risk](#what-counts-as-pre-main-risk)
+- [Common Sources of Pre-main Work](#common-sources-of-pre-main-work)
+- [Code Review Checklist](#code-review-checklist)
+- [Safer Design Directions](#safer-design-directions)
+- [Diagnostic Hints](#diagnostic-hints)
+- [What the Agent Can Inspect](#what-the-agent-can-inspect)
+- [Safe Patch Heuristics](#safe-patch-heuristics)
+- [Recommendation Language](#recommendation-language)
+- [Boundary With Other References](#boundary-with-other-references)
 
 ## Mental Model
 
-Pre-main is the part of launch that happens before the app enters its explicit application lifecycle code.
+Pre-main is the part of launch before the app reaches its own explicit application lifecycle code.
 
-In UIKit apps, this means before the app delegate and scene delegate startup path begins. In SwiftUI apps, this means before the SwiftUI `App` startup path begins. The exact implementation details can vary by toolchain, OS version, app type, and how the entry point is generated, so treat **pre-main** as an investigation boundary rather than a single source-code location.
+In UIKit lifecycle apps, this means before the app delegate and scene delegate startup path is under app control.
 
-At a high level, this area can include:
+In SwiftUI lifecycle apps, this means before SwiftUI `App` initialization and scene construction are under app control.
 
-1. Loading the main executable and dependent images.
-2. Mapping code and data into the process.
-3. Applying dyld fixups and connecting references between images.
-4. Registering runtime metadata needed by loaded images.
-5. Running load-time initializers such as Objective-C `+load`, C/C++ constructors, clang constructor functions, and functions in binary initializer sections.
-6. Handing control to the app entry path.
+Treat pre-main as an investigation boundary rather than a single source-code location.
 
-Do not treat all launch work as pre-main. Code inside `UIApplicationMain`, `@main App`, `AppDelegate`, `SceneDelegate`, root view/model initialization, or first-frame rendering is launch-critical, but it is not pre-main.
+Work in this phase can include:
+
+- loading the main executable
+- loading dynamic libraries and frameworks
+- mapping code and data
+- applying dyld fixups and bindings
+- registering Objective-C and Swift runtime metadata
+- running load-time initializers
+- running C/C++ constructors
+- preparing enough runtime state to transfer control into the app entry path
+
+Do not treat all launch work as pre-main. Work in `UIApplicationDelegate`, `UISceneDelegate`, SwiftUI `App`, root view setup, or first-screen rendering is launch-critical, but it is not pre-main.
 
 ## Why This Phase Matters
 
-Pre-main work is paid before the app can start building its first UI. If this phase is expensive, later deferral in app delegate, scene delegate, or SwiftUI lifecycle code cannot recover the time already spent.
+Pre-main work is paid before the app can run its own startup policy.
 
-The main review goal is to remove hidden eager work from load time and make initialization explicit, lazy, measurable, and scoped to the feature that actually needs it.
+That means the app cannot show a placeholder UI, schedule work later, or handle failure gracefully until this phase completes. If expensive work is hidden here, moving code out of `AppDelegate`, `SceneDelegate`, or SwiftUI `.task` will not address it.
 
-A good pre-main review answers four questions:
+The review goal is to answer:
 
-1. Is the slow time truly before app lifecycle code?
-2. Which image or initializer owns the time?
-3. Does that work have to run before first frame?
-4. Can it be removed, reduced, delayed, or made explicit?
+1. 1Is the slow time truly before app lifecycle code?
+2. 2Which image or initializer owns the time?
+3. 3Does that work have to run before first frame?
+4. 4Can it be removed, reduced, delayed, or made explicit?
+5. 5How will the same launch scenario be measured after the change?
+
+## Review Procedure
+
+When using this reference:
+
+1. 1Confirm the boundary.
+2. 2Identify the owner: app code, first-party framework, third-party framework, vendored binary SDK, Objective-C category, C/C++ code, or Swift static/global initialization.
+3. 3Classify the initializer source.
+4. 4Decide whether the work is truly required before app lifecycle code.
+5. 5Check whether the work can move to explicit startup, lazy feature setup, or a smaller readiness condition.
+6. 6Identify correctness risks: swizzling, runtime registration, crash/security/compliance, routing, SDK vendor requirements, or ABI/setup expectations.
+7. 7Recommend the smallest safe change.
+8. 8Validate with the same launch scenario and a release-like build.
+
+Do not recommend broad rewrites until the owner and boundary are clear.
 
 ## What Counts as Pre-main Risk
 
-Pre-main risk usually comes from work that is:
+Treat the following as pre-main or load-time risk until measured otherwise:
 
-- unconditional
-- hidden behind language/runtime hooks
-- triggered by image loading rather than feature use
-- expensive before the app can render UI
-- difficult to order, observe, or test
-- introduced by third-party binaries or generated code
+- Objective-C `+load`
+- C/C++ constructor functions
+- clang constructor attributes
+- nontrivial functions referenced from binary initializer sections
+- heavy Objective-C runtime registration caused by categories or large class graphs
+- swizzling performed from `+load`
+- static initialization triggered by load-time hooks
+- dynamic frameworks loaded before app lifecycle code
+- vendored binary SDKs that execute work while being loaded
 
-The problem is not only raw CPU time. Load-time work can also create ordering hazards, unexpected dependency setup, main-thread assumptions, lock contention, I/O before the app is ready, and startup behavior that is hard for later maintainers to understand.
+Do not automatically treat the following as pre-main work:
+
+- every Swift `static let`
+- every Swift global declaration
+- every Objective-C category
+- every dynamic framework
+- every linked dependency
+- work that runs in `didFinishLaunching`
+- work that runs in SwiftUI `App.init`
+- work that runs in `.task`, `.onAppear`, or first-screen code
+
+If the code runs after the app lifecycle has started, route to the lifecycle, SwiftUI, orchestration, SDK, or first-frame reference.
 
 ## Common Sources of Pre-main Work
 
 ### Objective-C `+load`
 
-`+load` is called when a class or category is loaded into the Objective-C runtime. It is not tied to whether the app uses that class on the first screen.
+`+load` runs when the Objective-C runtime loads the class or category. It can execute before app lifecycle code and is a common source of hidden launch work.
 
 Treat every `+load` implementation as launch-critical until proven otherwise.
 
-Review for:
+High-risk work inside `+load`:
 
+- networking
+- disk I/O
+- database setup
+- keychain access
+- dependency graph construction
+- analytics startup
+- SDK startup
+- large parsing or decoding
+- broad notification registration
 - method swizzling
-- runtime scanning
-- service registration
-- singleton creation
-- dependency lookup
-- logging or analytics setup
-- file, keychain, database, or network access
-- locks, semaphores, or synchronous dispatch
-- large allocations, decoding, parsing, or reflection-like work
+- synchronization that can block
+- calling into other subsystems with unclear readiness
 
-Prefer:
-
-- explicit registration from a known startup point
-- lazy registration on first feature use
-- narrow one-time setup guarded by a cheap path
-- compile-time configuration when possible
-- vendor-supported minimal initialization modes for SDKs
-
-Acceptable `+load` work should be tiny, deterministic, independent of app state, and free of I/O. Avoid depending on ordering between unrelated classes, categories, or libraries.
+Prefer explicit registration or lazy setup when possible.
 
 ### Objective-C `+initialize`
 
-`+initialize` is lazy compared with `+load`; it runs before a class receives its first message. This can reduce unconditional launch work in legacy Objective-C code, but it is not a universal replacement.
+`+initialize` is different from `+load`. It is invoked before the class receives its first message, not simply because the image was loaded.
 
-Use it carefully because it still hides work behind runtime behavior and can move latency to the first call site. It may also make ordering and failure behavior harder to reason about.
+This can delay work, but it is not a universal fix.
 
-Prefer this order when changing code:
+Do not recommend replacing `+load` with `+initialize` as a blanket rule. `+initialize` can still occur early, may run on a sensitive path, and can introduce ordering or locking surprises.
 
-1. Remove the need for load-time initialization.
-2. Move required registration to explicit startup code if it is truly launch-critical.
-3. Make setup lazy and feature-scoped when first-frame correctness does not require it.
-4. Use `+initialize` only when maintaining Objective-C code where its semantics are appropriate.
+Prefer explicit, named initialization when the app needs predictable startup behavior.
 
-Do not recommend replacing `+load` with `+initialize` as a blanket rule.
+### C/C++ Constructors
 
-### C and C++ Constructors
+C/C++ constructors can run before app lifecycle code.
 
-C++ global objects with nontrivial constructors and functions marked with constructor attributes can run before the app entry path.
+Look for:
 
-Review for:
+- global objects with nontrivial constructors
+- `__attribute__((constructor))`
+- library-level registration code
+- setup performed by static objects
+- logging, analytics, storage, or runtime hooks initialized from constructors
 
-- global objects that allocate memory
-- constructors that open files, databases, sockets, or caches
-- constructors that create threads, queues, locks, or observers
-- registration systems that scan types, modules, or plugins
-- hidden dependency setup inside native libraries
-
-Prefer explicit initialization functions that the app calls at a chosen point. If a constructor is unavoidable, keep it local, fast, deterministic, and free of app-level dependencies.
+Keep constructors trivial. Move app-owned setup to explicit startup or lazy feature initialization.
 
 ### Binary Initializer Sections
 
-Functions linked into initializer sections, such as `__mod_init_func`, are part of the same load-time risk area. They may come from C, C++, Objective-C, Swift interoperability code, generated code, package dependencies, or third-party binaries.
+Executable images may contain initializer sections such as `__mod_init_func`.
 
-When a trace shows static initializer time but source code does not obviously contain constructors or `+load`, inspect linked dependencies and generated/runtime support code as well as application code.
+The presence of an initializer section is a signal, not a diagnosis. The important questions are:
+
+- which binary owns it
+- which function runs
+- whether the function is app-owned or vendored
+- whether the function does meaningful work
+- whether the work is required before app lifecycle code
+- whether it can be removed, reduced, or moved
+
+Use binary inspection as a lead, then connect it back to source, vendor documentation, or trace evidence when possible.
 
 ### Objective-C Categories and Runtime Registration
 
-Objective-C classes, categories, protocols, selectors, and method metadata must be registered as images load. Categories with `+load` are especially important because their load methods can run even when the category's methods are not used on the launch path.
+Objective-C categories can contribute to runtime registration and may contain `+load`.
 
-Do not assume categories are free just because they contain no visible app startup code. They can still contribute metadata, and when they include `+load`, they can execute launch-time behavior.
+Not every category is a problem. The risk increases when categories:
 
-Review category-heavy modules for:
+- define `+load`
+- perform swizzling
+- target broad UIKit or Foundation classes
+- are spread across many dynamic images
+- are part of large SDKs
+- register observers, handlers, or services at load time
 
-- categories on very common Foundation/UIKit classes
-- swizzling performed from category `+load`
-- duplicated registration across modules
-- generated Objective-C bridging code from dependencies
-- categories bundled in third-party SDKs that are linked for unrelated features
+Focus on categories with behavior, not categories merely existing.
 
 ### Swift Globals and Static Properties
 
-Do not label every Swift `static let`, global value, or static property as pre-main work. Swift global and static stored values are commonly initialized lazily on first access.
+Do not label every Swift global, `static let`, or static property as pre-main work.
 
-The launch risk appears when:
+Swift initialization can be lazy depending on how the value is declared and accessed. The launch risk appears when the value is touched from load-time code, startup hooks, eager singletons, dependency graph setup, or early lifecycle code.
 
-- a Swift global or static value is touched by a load-time initializer
-- app startup code touches it before first frame
-- initialization performs heavy work
-- initialization builds a large dependency graph
-- initialization has side effects beyond simple value creation
-- initialization crosses into Objective-C/C/C++ code that performs load-time work
+Review:
 
-Prefer small, side-effect-free globals. Keep expensive setup behind explicit boundaries that match when the feature is actually needed.
+- whether the static/global value is expensive
+- whether it is touched before app lifecycle code
+- whether it performs I/O, parsing, locking, or large allocation
+- whether it creates a dependency graph
+- whether it can become a cheap placeholder plus lazy factory
+
+Use precise language: “this static is expensive if touched during launch” rather than “all statics are pre-main.”
 
 ### Dynamic Loading During Startup
 
-Dynamic loading that happens during startup is not necessarily pre-main if the app explicitly triggers it after entering lifecycle code. However, it can behave like launch-critical work if it happens before first frame or first interaction.
+Dynamic frameworks and libraries can contribute to pre-main or early launch cost through image loading, fixups, runtime registration, and initializer execution.
 
-If the task involves choosing static vs dynamic frameworks, mergeable libraries, resource bundles, or modularization trade-offs, route to `linking-strategy.md`. Use this file only to identify whether load-time behavior is part of the observed cost.
+Do not automatically blame a dynamic framework. Determine whether the cost is:
 
-## Review Procedure
+- many separate images
+- deep image dependency chains
+- initializer content
+- Objective-C or Swift metadata registration
+- runtime hooks
+- dynamic framework boundaries that exist only for historical modularization reasons
 
-When inspecting a pre-main suspicion, follow this sequence.
+Use this file for initializer content and load-time behavior.
 
-### 1. Confirm the boundary
-
-First verify whether the time is actually pre-main.
-
-Use evidence such as:
-
-- App Launch trace phase breakdown
-- dyld Activity/static-initializer attribution
-- Time Profiler showing work before app lifecycle frames
-- app-level signposts that start at the first app-controlled point and show a gap before app code begins
-
-Do not infer pre-main cost only from a slow first frame. First-frame delay can come from app delegate work, scene setup, SwiftUI root creation, layout, drawing, data access, or early post-launch blocking.
-
-### 2. Identify the owner
-
-Attribute the cost to the most specific owner available:
-
-- main executable
-- internal framework
-- third-party SDK
-- generated code
-- Swift/Objective-C interoperability layer
-- C/C++ library
-- system framework
-- unknown binary image
-
-If the owner is a system framework, avoid recommending changes to system internals. Instead, inspect whether application code or linked dependencies cause the system framework to load or initialize earlier than necessary.
-
-### 3. Classify the initializer
-
-Classify the source of the work:
-
-- Objective-C `+load`
-- Objective-C `+initialize`
-- C/C++ constructor
-- clang constructor function
-- function in an initializer section
-- runtime metadata registration
-- explicit dynamic loading
-- unknown static initializer
-
-The classification determines the fix. For example, `+load` usually calls for removing hidden load-time behavior, while explicit dynamic loading may require moving the call to a later app phase.
-
-### 4. Decide whether the work is truly launch-critical
-
-Ask:
-
-- Is this needed before first app frame?
-- Is it needed before first interaction?
-- Is it needed only for routing, crash capture, security, auth, or feature flags?
-- Can the first screen render without it?
-- Can the setup happen on first feature use?
-- Can the SDK or subsystem start in a smaller mode?
-
-If the work is not required before first frame, move it out of load time. If it is required, reduce it to the smallest safe operation.
-
-### 5. Validate with the same scenario
-
-Re-measure using the same launch scenario, device class, OS version, build configuration, and app state. Avoid mixing cold, warm, prewarmed, and resume measurements.
+Use `linking-strategy.md` when the main decision is whether to keep, merge, static-link, remove, or move a framework in the shipped release product.
 
 ## Code Review Checklist
 
-Use this checklist when reviewing Objective-C, C/C++, mixed Swift/Objective-C modules, or binary dependencies on the launch path.
+When reviewing source code for pre-main risk, check:
 
-- [ ] No app-level work is hidden inside Objective-C `+load`.
-- [ ] Any remaining `+load` methods are tiny, deterministic, and documented.
-- [ ] `+load` is not used for networking, disk I/O, database setup, keychain access, analytics setup, dependency graph construction, or large parsing work.
-- [ ] Method swizzling from `+load` is justified, minimal, and isolated.
-- [ ] There are no C/C++ global constructors doing expensive work.
-- [ ] Constructor attributes are not used as a substitute for explicit startup APIs.
-- [ ] Heavy Swift globals or static values are not touched by pre-main hooks.
-- [ ] Objective-C categories with `+load` are audited, especially in third-party frameworks.
-- [ ] Initializer ordering assumptions are avoided.
-- [ ] Third-party binaries with static initializer cost are tracked separately from application code.
-- [ ] Debug-only dyld or Objective-C runtime environment variables are not treated as production behavior.
-- [ ] Any change to load-time behavior is validated with the same launch scenario and build configuration.
+- [ ] Are there Objective-C `+load` methods?
+- [ ] Do any `+load` methods perform app-level work?
+- [ ] Do any `+load` methods call into SDKs, dependency containers, databases, keychain, networking, analytics, logging, or feature registries?
+- [ ] Are there C/C++ constructors or clang constructor attributes?
+- [ ] Are there global C++ objects with nontrivial constructors?
+- [ ] Are there Objective-C categories that define `+load` or swizzle broad classes?
+- [ ] Are there expensive Swift globals/statics touched from load-time hooks?
+- [ ] Are binary initializer sections present in app-owned or vendored images?
+- [ ] Are dynamic frameworks doing meaningful initializer work?
+- [ ] Is the suspected code truly before app lifecycle code?
+- [ ] Is the recommendation validated with the same launch scenario?
 
 ## Safer Design Directions
 
-### Replace hidden load-time work with explicit registration
-
-Prefer a named registration point that is called by the app when the capability is actually required.
-
-Good registration points are:
-
-- easy to find in code review
-- scoped to the feature or subsystem
-- safe to call once
-- clear about failure behavior
-- free of unrelated diagnostics or secondary setup
-
-Avoid combining route registration, analytics, cache warming, dependency graph construction, and network setup in the same load-time hook.
-
-### Keep constructors trivial
-
-A constructor that only registers a tiny local table is different from a constructor that opens storage, starts queues, reads files, creates threads, or initializes a subsystem.
-
-When constructor behavior is unavoidable:
-
-- keep it small
-- avoid I/O
-- avoid locks that can interact with app startup
-- avoid app state assumptions
-- avoid calling into high-level application services
-- document why explicit initialization is not possible
-
-### Keep Swift static initialization cheap
-
-Static values are not inherently bad. The problem is hiding large or side-effecting work behind static access that happens during launch.
+### Move app-owned work out of `+load`
 
 Prefer:
 
-- simple constants
-- small immutable values
-- factories that create only launch-critical services
-- feature-scoped lazy state
-- explicit async setup for expensive work
+- explicit registration from a known startup phase
+- lazy registration when a feature opens
+- dependency injection from app-owned startup code
+- small static tables instead of runtime work
+- one-time setup guarded by explicit readiness
 
 Avoid:
 
-- building the full service graph from a static property
-- touching storage/network/keychain from static initialization
-- static initialization that changes global process state
-- static initialization whose first access happens indirectly from `+load` or constructor code
+- network, file, keychain, database, analytics, or SDK startup from `+load`
+- broad swizzling from `+load`
+- hidden dependency graph construction from load-time hooks
+
+### Keep constructors trivial
+
+C/C++ constructors should not perform broad app setup.
+
+Prefer:
+
+- compile-time constants
+- cheap table registration
+- explicit setup calls
+- lazy initialization
+- moving heavyweight work behind app lifecycle control
+
+### Make Swift static initialization cheap and explicit
+
+If a Swift static/global value is expensive and touched early, prefer:
+
+- storing a lightweight descriptor
+- using a lazy factory
+- moving heavy parsing or I/O behind an explicit method
+- splitting cheap metadata from expensive runtime state
+- making dependency creation visible at the call site
 
 ### Keep swizzling narrow and auditable
 
@@ -332,7 +326,99 @@ Potential debug tools and signals:
 - debug-only environment variables such as `DYLD_PRINT_LIBRARIES` or `OBJC_PRINT_LOAD_METHODS`, when supported by the current run environment
 - binary inspection tools such as `otool`, `nm`, `dyld_info`, or link maps for advanced investigations
 
+Use this section to identify useful signals. For detailed tool setup and metric interpretation, route to `metrics-instruments-xctest-metrickit.md`.
+
 Do not overfit to one run. Pre-main measurements can vary by device state, OS version, install state, cache warmth, app update state, and build configuration.
+
+## What the Agent Can Inspect
+
+When repository access is available, inspect concrete load-time patterns instead of giving generic advice.
+
+Search for Objective-C load and initialize methods:
+
+```sh
+rg "\+\s*\(void\)load|\+\s*\(void\)initialize" .
+```
+
+Search for C/C++ constructors and clang constructor attributes:
+
+```sh
+rg "__attribute__\s*\(\(constructor\)\)|constructor\s*\(" .
+```
+
+Search for swizzling and broad Objective-C runtime hooks:
+
+```sh
+rg "method_exchangeImplementations|class_replaceMethod|objc_getClass|objc_allocateClassPair|NSClassFromString|performSelector" .
+```
+
+Search for static or global values that may be touched early:
+
+```sh
+rg "static let|static var|static .* =|let .* =|var .* =" .
+```
+
+Search for expensive work near load-time hooks:
+
+```sh
+rg "Data\(|contentsOf:|FileManager|Keychain|SecItem|JSONDecoder|PropertyListDecoder|sqlite|migrate|URLSession|wait\(|semaphore|sync\(" .
+```
+
+When a built binary is available, inspect load-time sections and symbols:
+
+```sh
+otool -l path/to/binary | rg "__mod_init_func|__objc"
+```
+
+```sh
+nm -m path/to/binary | rg " load| initialize|constructor|mod_init|__mod_init"
+```
+
+Use command matches as leads, not proof. Confirm that the code or binary actually contributes to pre-main or load-time cost.
+
+The agent can:
+
+- identify app-owned `+load`, `+initialize`, constructors, and swizzling
+- find expensive work called from load-time hooks
+- suggest moving app-owned work to explicit startup or lazy setup
+- recommend binary inspection when source is not available
+- ask for App Launch traces or pre-main evidence when the boundary is unclear
+
+The agent cannot reliably:
+
+- rewrite vendor SDK load-time behavior without vendor guidance
+- prove production impact from source search alone
+- treat every static/global as pre-main work
+- treat every dynamic framework as the bottleneck
+- promise a fixed millisecond improvement without measurement
+
+## Safe Patch Heuristics
+
+When the agent is allowed to edit code, prefer small, reversible changes.
+
+Good patch candidates:
+
+- move app-owned noncritical work from `+load` to explicit startup
+- replace constructor-based app setup with explicit initialization
+- split heavy static initialization into a cheap static descriptor plus lazy factory
+- remove disk, network, keychain, database, parsing, or analytics work from load-time hooks
+- add a small explicit registration call where ordering and failure are visible
+- narrow app-owned swizzling or move it behind explicit setup when safe
+- add signposts around the first app-controlled startup point
+- add comments documenting why unavoidable load-time work must remain early
+
+Risky patch candidates requiring extra care:
+
+- changing vendor SDK `+load` behavior without vendor support
+- replacing `+load` with `+initialize` as a blanket fix
+- changing swizzling order
+- moving crash reporting, security, fraud, payment, privacy, or compliance setup without product review
+- changing Objective-C categories used for runtime behavior
+- removing C/C++ constructors from libraries without understanding ABI or setup requirements
+- changing dynamic/static linkage when the real issue is initializer content
+- hiding work behind lazy initialization without a loading, failure, or retry plan
+
+If correctness is uncertain, recommend measurement, isolation, or vendor guidance before behavior-changing edits.
 
 ## Recommendation Language
 
@@ -352,14 +438,74 @@ Avoid language that overclaims:
 - Do not promise a fixed improvement from removing a single initializer.
 - Do not treat debug-only environment variable output as a production metric.
 
-## Boundaries With Other References
+## Boundary With Other References
 
-Route to another reference when the main issue is outside pre-main:
+Use this reference for pre-main and load-time behavior.
 
-- Use `launch-taxonomy-and-targets.md` for cold/warm/prewarmed/resume definitions, first-frame targets, and measurement comparability.
-- Use `linking-strategy.md` for deciding between dynamic frameworks, static libraries, mergeable libraries, modularization, binary size, or build-time trade-offs.
-- Use `launch-orchestration-and-dependency-graph.md` for ordered startup steps, dependency graphs, critical path analysis, safe parallelism, and launch step failure handling.
-- Use `appdelegate-scenedelegate-and-first-frame.md` for work inside `didFinishLaunching`, scene connection, dependency containers, root UI creation, or main-thread deferral.
-- Use `swiftui-app-launch.md` for `@main App`, root `Scene`, root view initialization, observable state, `.task`, or `.onAppear` work.
-- Use `third-party-sdks-at-launch.md` for vendor-specific startup policies, deferred SDK modes, crash reporting, attribution, ads, analytics, remote config, push, security, or feature flags.
-- Use `metrics-instruments-xctest-metrickit.md` for detailed tool usage, launch metric interpretation, CI baselines, MetricKit, Organizer, or production monitoring.
+Read `references/launch-taxonomy-and-targets.md` when the issue involves:
+
+- cold, warm, prewarmed, resume, first install, or update launch terminology
+- launch target selection
+- measurement scenario classification
+- whether two numbers are comparable
+
+Read `references/linking-strategy.md` when the issue involves:
+
+- deciding between dynamic frameworks, static libraries, and mergeable libraries
+- modularization and binary-size trade-offs
+- whether a framework should remain a separate launch-loaded image
+- release-bundle dependency structure
+- app/extension dependency duplication
+
+Read `references/launch-orchestration-and-dependency-graph.md` when the issue involves:
+
+- ordered startup steps
+- dependency graphs
+- critical path analysis
+- safe parallelism
+- launch step failure handling
+- longest-chain optimization
+
+Read `references/appdelegate-scenedelegate-and-first-frame.md` when the issue involves:
+
+- work inside `didFinishLaunching`
+- scene connection
+- dependency containers
+- root UI creation
+- first-frame readiness
+- main-thread lifecycle work
+
+Read `references/swiftui-app-launch.md` when the issue involves:
+
+- SwiftUI `App`
+- root `Scene`
+- root view initialization
+- observable state
+- `.task`
+- `.onAppear`
+- `scenePhase`
+- `@UIApplicationDelegateAdaptor`
+
+Read `references/third-party-sdks-at-launch.md` when the issue involves:
+
+- vendor-specific startup policies
+- deferred SDK modes
+- crash reporting
+- attribution
+- ads
+- analytics
+- remote config
+- push
+- security
+- feature flags
+
+Read `references/metrics-instruments-xctest-metrickit.md` when the issue involves:
+
+- detailed tool usage
+- launch metric interpretation
+- CI baselines
+- MetricKit
+- Organizer
+- production monitoring
+
+Do not read all references by default.
