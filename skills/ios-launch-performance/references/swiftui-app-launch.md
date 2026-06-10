@@ -1,508 +1,608 @@
 # SwiftUI App Launch
 
-Use this reference when a launch investigation involves SwiftUI lifecycle code: `@main App`, root `Scene` construction, `WindowGroup`, root view setup, root observable state, environment injection, `.task`, `.task(id:)`, `.onAppear`, `scenePhase`, or SwiftUI-to-UIKit delegate bridging.
+Use this reference when a launch investigation involves SwiftUI lifecycle code: `@main App`, root `Scene`, `WindowGroup`, root view setup, root observable state, environment injection, `.task`, `.task(id:)`, `.onAppear`, `scenePhase`, or SwiftUI-to-UIKit delegate bridging.
 
-Keep this file focused on SwiftUI-specific launch behavior. Do not use it as the primary guide for dyld/pre-main work, framework linking, UIKit lifecycle implementation, third-party SDK policy, launch orchestration, or launch measurement tooling.
+Keep this file focused on **SwiftUI work that affects launch, first frame, or early responsiveness**. Do not use it as a general SwiftUI performance guide for scrolling, diffing, identity, layout, invalidation, or rendering unless the issue is on the launch path.
 
 ## Scope Boundary
 
 This file covers:
 
-- SwiftUI `@main App` startup code
-- stored properties and `init` in the app type
+- SwiftUI lifecycle apps using `@main App`
+- `App` stored properties and `App.init`
 - root `Scene` and `WindowGroup` construction
-- root view initialization
-- root model ownership with `@StateObject`, `@State`, `@Observable`, `ObservableObject`, and environment injection
-- eager dependency setup caused by root view/model construction
-- `.task`, `.task(id:)`, `.onAppear`, and `scenePhase` work that starts during or immediately after launch
-- `@UIApplicationDelegateAdaptor` in SwiftUI lifecycle apps
-- SwiftUI-specific first-screen readiness
-- post-visible work that can still affect early responsiveness
+- root view creation
+- root observable model creation
+- `@StateObject`, `@State`, `@Observable`, `ObservableObject`, and environment-owned launch state
+- `.environment`, `.environmentObject`, `modelContainer`, and root dependency injection
+- `.task`, `.task(id:)`, `.onAppear`, `onChange`, and `scenePhase` work that affects launch or resume
+- `@UIApplicationDelegateAdaptor` and hybrid SwiftUI/UIKit startup paths
+- duplicate startup work across SwiftUI lifecycle, delegate adaptors, root views, and lifecycle-bound modifiers
+- first-frame and early post-launch responsiveness in SwiftUI apps
 
 This file does not cover:
 
-- dyld, pre-main, Objective-C `+load`, constructor functions, or static initializer internals; use `pre-main-dyld-and-static-initializers.md`
-- static vs dynamic linking, mergeable libraries, or framework dependency strategy; use `linking-strategy.md`
-- UIKit `UIApplicationDelegate` / `UISceneDelegate` implementation, root `UIWindow`, or `UIViewController` first-frame setup; use `appdelegate-scenedelegate-and-first-frame.md`
-- launch-step dependency graphs, critical-path scheduling, and safe launch parallelism; use `launch-orchestration-and-dependency-graph.md`
-- SDK-specific startup policy for analytics, ads, crash reporting, attribution, push, remote config, feature flags, or security vendors; use `third-party-sdks-at-launch.md`
-- Instruments, Time Profiler, XCTest, MetricKit, Organizer, signpost design, or CI baselines; use `metrics-instruments-xctest-metrickit.md`
-- general SwiftUI scrolling, diffing, identity, animation, layout, or memory performance unless the code is on the launch path
+- dyld, pre-main, `+load`, constructor functions, or static initializer diagnosis
+- static, dynamic, or mergeable linking strategy
+- detailed UIKit lifecycle implementation
+- third-party SDK startup policy
+- generic launch dependency graph design
+- tool-specific launch measurement setup
+- general SwiftUI scrolling, layout, identity, or invalidation performance unrelated to launch
+
+Use this file to identify SwiftUI entry points and launch-path ownership. Route implementation details to the focused reference when the issue belongs elsewhere.
+
+## Contents
+
+- [Core Model](#core-model)
+- [Review Procedure](#review-procedure)
+- [SwiftUI Launch Path](#swiftui-launch-path)
+- [App Type and App.init](#app-type-and-appinit)
+- [Scene and WindowGroup Construction](#scene-and-windowgroup-construction)
+- [Root View and Root Model Setup](#root-view-and-root-model-setup)
+- [Environment Injection](#environment-injection)
+- [Lifecycle-Bound Work](#lifecycle-bound-work)
+- [.task, .onAppear, and scenePhase](#task-onappear-and-scenephase)
+- [Delegate Bridging in SwiftUI Lifecycle Apps](#delegate-bridging-in-swiftui-lifecycle-apps)
+- [First-Frame and Early Responsiveness](#first-frame-and-early-responsiveness)
+- [Duplicate Startup Paths](#duplicate-startup-paths)
+- [What the Agent Can Inspect](#what-the-agent-can-inspect)
+- [Safe Patch Heuristics](#safe-patch-heuristics)
+- [Review Checklist](#review-checklist)
+- [Agent Guidance](#agent-guidance)
+- [Boundary With Other References](#boundary-with-other-references)
 
 ## Core Model
 
-In a SwiftUI lifecycle app, SwiftUI creates the app value, evaluates its scenes, creates the active scene's root view hierarchy, manages observable state ownership, and starts lifecycle-bound work as views and scenes enter the hierarchy.
+SwiftUI launch work is often distributed.
 
-For launch review, model the SwiftUI path as:
+In a SwiftUI lifecycle app, startup work can appear in:
+
+- stored properties of the `App` type
+- `App.init`
+- `Scene` construction
+- `WindowGroup`
+- root view initialization
+- root observable state creation
+- dependency containers injected through the environment
+- `modelContainer` setup
+- `@UIApplicationDelegateAdaptor`
+- `.task`
+- `.task(id:)`
+- `.onAppear`
+- `scenePhase` handlers
+- first-screen view models
+
+The danger is that launch code can look declarative and harmless while still building a large object graph, resolving dependencies, starting tasks, touching storage, or triggering main-actor work before the first screen is useful.
+
+The goal is not to make the SwiftUI root empty. The goal is to keep only the work required for a valid first frame or first meaningful interaction on the launch path.
+
+## Review Procedure
+
+When using this reference:
+
+1. 1Identify whether the app uses SwiftUI lifecycle, UIKit lifecycle, or a hybrid setup.
+2. 2Trace the launch path from `@main App` to the first visible view.
+3. 3Inspect stored properties and `App.init`.
+4. 4Inspect `Scene` and `WindowGroup` construction.
+5. 5Inspect root view and root model initialization.
+6. 6Inspect environment injection, dependency containers, and persistence setup.
+7. 7Inspect `.task`, `.task(id:)`, `.onAppear`, `onChange`, and `scenePhase` work.
+8. 8Check `@UIApplicationDelegateAdaptor` for hidden or duplicated startup work.
+9. 9Classify each task as first-frame, first-interaction, soon-after-launch, resume-only, feature-lazy, or background maintenance.
+10. 10Recommend the smallest safe change and define validation.
+
+Do not treat SwiftUI lifecycle modifiers as automatically safe post-launch work. Confirm when they run and what resources they compete for.
+
+## SwiftUI Launch Path
+
+A typical SwiftUI lifecycle launch path can involve:
 
 ```text
-@main App instance
-→ app stored properties
+process and runtime startup
+→ SwiftUI App value creation
+→ App stored property initialization
 → App.init
-→ Scene declaration
-→ WindowGroup root content
-→ root view and root model creation
-→ environment setup
-→ first root body evaluation / layout / draw
-→ lifecycle-bound startup work
+→ body evaluation for scenes
+→ WindowGroup / Scene construction
+→ root view creation
+→ root state and environment setup
+→ first layout and rendering
+→ lifecycle-bound work starts
 → early responsiveness
 ```
 
-The goal is not to avoid all startup work in SwiftUI. The goal is to keep the first visible shell cheap, deterministic, and correct while moving secondary work behind explicit readiness points.
+This is a simplified model. The exact path depends on app structure, OS behavior, scene lifecycle, prewarming, restoration, and entry point.
 
-Do not assume SwiftUI lifecycle callbacks are single-use launch hooks. Root views can be recreated, tasks can be cancelled and restarted, scene phase changes also happen during resume, and observable models can trigger broad updates immediately after launch.
+Do not assume that work moved out of `App.init` is automatically outside launch. It may still run during root scene construction, root view initialization, `.task`, `.onAppear`, or first-screen model setup.
 
-## What the Agent Can Inspect
+## App Type and App.init
 
-When repository access is available, inspect SwiftUI launch entry points and root dependencies before giving generic advice.
+Treat the SwiftUI `App` type as a launch boundary.
 
-Search for SwiftUI app entry points:
+High-risk patterns in `App` stored properties and `App.init`:
 
-```sh
-rg "@main|: App|WindowGroup|DocumentGroup|Settings\\s*\\{" .
-```
+- dependency container construction
+- service locator setup
+- database opening or migration
+- keychain-heavy work
+- file reads
+- JSON or plist decoding
+- remote configuration
+- feature flag fetching
+- analytics or logging startup
+- SDK initialization
+- session restoration
+- root route resolution that requires I/O
+- large object graph construction
+- synchronous waits
+- main-actor blocking work
 
-Search for UIKit delegate bridging in SwiftUI lifecycle apps:
-
-```sh
-rg "UIApplicationDelegateAdaptor" .
-```
-
-Search for root lifecycle-triggered work:
-
-```sh
-rg "\\.task\\s*\\{|\\.task\\s*\\(|\\.onAppear\\s*\\{|scenePhase|onChange\\s*\\(of:.*scenePhase" .
-```
-
-Search for eager root state and dependency injection:
-
-```sh
-rg "@StateObject|@Observable|ObservableObject|@EnvironmentObject|\\.environment\\(|\\.environmentObject\\(|modelContainer|container|resolver|dependencies|graph" .
-```
-
-Search for expensive work that may be reached from root initialization or root lifecycle callbacks:
-
-```sh
-rg "Data\\(|contentsOf:|FileManager|Keychain|SecItem|JSONDecoder|PropertyListDecoder|migrate|migration|open|load|fetch|refresh|sync|wait\\(|semaphore|DispatchQueue\\.main\\.sync|Task\\.detached" .
-```
-
-Use search results as leads only. Confirm whether the code is actually reached during launch, whether it blocks the main actor, and whether the first visible UI or first interaction depends on it.
-
-The agent can:
-
-- trace the SwiftUI launch path from `@main App` to the first visible view
-- identify heavy app stored properties, `App.init` work, root model construction, and environment setup
-- classify root `.task`, `.onAppear`, and `scenePhase` work by launch necessity
-- detect duplicate startup paths between SwiftUI lifecycle code and delegate adaptors
-- suggest splitting launch-critical state from full app state
-- suggest lazy creation of feature-specific services and root models
-- propose idempotency for lifecycle callbacks that may run more than once
-- hand off UIKit, SDK, orchestration, or measurement details to the appropriate reference
-- propose small behavior-preserving patches when repository context is sufficient
-
-The agent cannot reliably:
-
-- prove first-frame timing without measurement or a trace
-- infer whether `.task` starts after the first frame is displayed
-- assume `.onAppear` runs only once
-- assume `scenePhase == .active` means a fresh app launch
-- move UI-bound work away from the main actor without checking API and isolation requirements
-- defer authentication, routing, security, crash reporting, privacy, or compliance work without product context
-- know whether a root model initializer is expensive without inspecting its call graph
-- assume Observation automatically solves launch cost; model construction and first reads can still be expensive
-
-## SwiftUI Launch Review Areas
-
-### App Stored Properties and `App.init`
-
-Review the `@main App` type first. Stored properties and `init` often look harmless while hiding work that must finish before the first scene can render.
-
-Look for:
-
-- dependency containers created eagerly
-- global coordinators that start subsystems in their initializer
-- persistence containers or model containers created before the first scene appears
-- keychain or session reads that expand into slow call chains
-- remote configuration, token refresh, or network checks started from the app type
-- analytics, logging, push, attribution, feature flags, or SDK startup in the app type
-- work hidden behind names such as `shared`, `live`, `default`, `make`, `bootstrap`, `configure`, `resolve`, or `start`
-- root models that subscribe to many notifications, publishers, async streams, or observers during construction
+`App.init` should usually be boring. It can establish minimal process-level state, but it should not become a replacement for the old “put everything in AppDelegate” pattern.
 
 Prefer:
 
-- a small app type that creates only the first visible shell
-- cheap local state used to choose the initial route
-- explicit bootstrap phases instead of hidden work in stored properties
-- lazy services for features that are not visible at launch
-- a narrow launch model instead of a full application graph
-- fast local decisions for routing, security, and session state when correctness requires them before UI
+- cheap configuration
+- minimal local state
+- lightweight dependency descriptors
+- factories instead of fully built graphs
+- explicit startup phases
+- lazy feature-owned setup
+- a first screen that can render with partial readiness
 
-Avoid:
+If `App.init` contains SDK startup, route SDK policy to `third-party-sdks-at-launch.md`.
 
-- starting every subsystem because `App.init` is a convenient central location
-- doing blocking I/O before any scene can render
-- making the root dependency container resolve all services eagerly
-- hiding expensive work behind property wrappers, singletons, or static factories
-- starting unowned background tasks from `App.init` without cancellation, priority, and failure handling
+If `App.init` builds a large ordered startup graph, route scheduling and dependency decisions to `launch-orchestration-and-dependency-graph.md`.
 
-Review direction:
+## Scene and WindowGroup Construction
 
-- Keep `App.init` minimal.
-- If state is required before the first view, make the state small and locally available.
-- Move secondary work to explicit startup methods, post-visible phases, or feature-owned lazy initialization.
-- Route SDK-specific decisions to `third-party-sdks-at-launch.md`.
-- Route multi-step dependency scheduling to `launch-orchestration-and-dependency-graph.md`.
-
-### Root `Scene` and `WindowGroup`
-
-Review the closure that creates the first SwiftUI hierarchy.
-
-Look for:
-
-- root views that construct many feature modules immediately
-- branches that compute expensive state before choosing the initial route
-- expensive environment values computed inline
-- root modifiers that start persistence, networking, or SDK setup
-- model containers attached at the root without checking whether the first screen needs them immediately
-- synchronous restoration of large navigation or tab state
-- eager setup for tabs, flows, or features that are not visible on the first screen
-
-Prefer:
-
-- a lightweight shell that can render with minimal local state
-- route decisions based on cheap already-local information
-- factories or handles instead of fully initialized feature graphs
-- first-screen dependencies separated from later-tab dependencies
-- progressive loading for first-screen content
-- safe defaults when remote configuration is not yet available and product rules allow it
-
-Avoid treating `WindowGroup` as an application bootstrap method. It declares scenes and root content; it should not become a hidden service startup hub.
-
-### Root View Initialization
-
-SwiftUI views are values and may be recreated. The launch risk is not the existence of a view initializer; the risk is expensive, side-effectful, or blocking work while constructing the root hierarchy.
-
-Look for root view initializers that:
-
-- synchronously load files or decode large data
-- open databases or perform migrations
-- touch keychain or secure storage repeatedly
-- resolve many services from a container
-- create image caches, formatters, search indexes, or stores eagerly
-- start tasks, timers, observers, or notifications as side effects
-- compute first-screen content that could be cached, placeholder-based, or asynchronous
-
-Prefer initializers that only assign already-prepared dependencies or cheap value state.
-
-If setup is required, move it to a model or coordinator with an explicit method and clear lifecycle. Then decide whether that method must run before first frame, before first interaction, after the shell is visible, or only when a feature is opened.
-
-### Root Observable State
-
-Root observable objects and models are frequent launch bottlenecks because their initializers often become application startup code.
-
-Check:
-
-- `@StateObject` initializers in root views
-- `@State` owners for `@Observable` models
-- `ObservableObject` instances injected as environment objects
-- global stores or app state objects passed through root environment
-- model initializers that resolve services, fetch data, subscribe broadly, or start refreshes
-- immediate mutations after construction that invalidate a large part of the root hierarchy
-
-Prefer:
-
-- cheap model construction
-- explicit async loading after construction
-- a small launch-specific state object separate from full app state
-- lazy child models for screens not visible at launch
-- cached state for the first visible UI
-- narrow observable dependencies for the first shell
-
-Avoid:
-
-- making one root app state object own every subsystem immediately
-- starting network refreshes, data sync, migrations, or cache cleanup in model `init`
-- using `@StateObject` or `@State` ownership as a place to hide expensive startup work
-- injecting a massive environment object that constructs the whole app before the first screen
-
-When suggesting changes, preserve SwiftUI ownership rules. Do not replace `@StateObject` with `@ObservedObject` just to change launch timing. Fix the initializer, ownership boundary, or loading phase instead.
-
-Observation can reduce unnecessary view updates compared with broader observable patterns, but it does not make expensive model creation free. Treat model initialization, first property reads, and initial async loading as separate launch concerns.
-
-## Lifecycle-Triggered Work
-
-### `.task`
-
-Treat `.task` as asynchronous work whose lifetime is tied to the modified view. SwiftUI can cancel it when the view disappears or its identity changes. With `.task(id:)`, changing the id can cancel and restart the task.
-
-This makes `.task` useful for cancellable view-bound work, but it is not a guarantee that the work starts only after the first frame is displayed.
-
-Review root `.task` closures for:
-
-- long main-actor sections
-- synchronous work before the first suspension point
-- immediate network or persistence work needed only by later features
-- repeated execution because the view is recreated or reinserted
-- `.task(id:)` restarts caused by unstable identifiers
-- cancellation and failure behavior
-- priority that competes with early interaction
-- duplicate startup also triggered from `App.init`, delegate adaptors, `.onAppear`, or `scenePhase`
-
-Prefer:
-
-- short setup before the first suspension point
-- cancellable async work
-- stable ids when restart behavior is intentional
-- explicit guards for one-time startup when one-time semantics are required
-- feature-specific work started by feature entry points, not the root shell
-- clear separation between first-frame work and early post-visible work
-
-Do not describe `.task` as automatically post-render. Say that it is lifecycle-bound async work, then require measurement if the launch impact matters.
-
-### `.onAppear`
-
-Treat `.onAppear` as a visibility callback, not as a one-time launch hook.
-
-Review `.onAppear` closures for:
-
-- repeated startup work when navigation, scene changes, identity changes, or conditional root branches reinsert the view
-- synchronous main-thread work
-- unstructured `Task` creation without cancellation ownership
-- duplicate calls also triggered by `.task` or `scenePhase`
-- state mutations that cause immediate expensive root re-rendering
-
-Prefer:
-
-- `.task` for cancellable async work tied to a view lifetime
-- an explicit model or coordinator method for one-time app/session setup
-- idempotency when repeated execution would be incorrect or expensive
-- small appearance work that updates visible UI rather than global app state
-
-### `scenePhase`
-
-Use `scenePhase` for scene lifecycle reactions. Do not use it as a blanket cold-launch detector.
-
-Review `scenePhase` handlers for:
-
-- running launch setup on every `.active` transition
-- treating foreground resume as cold launch
-- refreshing too much data immediately when returning from background
-- duplicating work already started from `.task`, `.onAppear`, `App.init`, or delegate callbacks
-- doing heavy work while the first scene is trying to become interactive
-- work that should happen on background transition but waits until the next active transition
-
-Prefer:
-
-- separate handling for first launch and foreground resume
-- freshness-based refresh policies
-- cheap foreground checks followed by lazy or cancellable refresh
-- explicit state that records whether initial setup already completed
-- minimal background cleanup that runs promptly when entering background
-
-Use `launch-taxonomy-and-targets.md` when the distinction between cold launch, warm launch, prewarmed launch, and resume matters.
-
-## Delegate Bridging in SwiftUI Lifecycle Apps
-
-SwiftUI lifecycle apps can still bridge to UIKit delegate callbacks with `@UIApplicationDelegateAdaptor`. Treat the adapted delegate as part of the launch path when it starts work during launch.
+`Scene` and `WindowGroup` construction can still be part of launch.
 
 Review:
 
-- `@UIApplicationDelegateAdaptor` declarations
-- adapted delegate initializers
-- `application(_:didFinishLaunchingWithOptions:)` in the adapted delegate
-- push notification, deep link, security, crash reporting, or SDK setup performed through the delegate
-- duplicated initialization between the app type, root tasks, scene phase handlers, and delegate callbacks
+- whether scene construction creates heavy root views
+- whether `WindowGroup` captures large models or containers
+- whether route selection happens synchronously
+- whether scene creation duplicates process-wide setup
+- whether multiple scenes can recreate global work
+- whether scene restoration triggers first-launch-only work
+- whether the app builds more UI than the first visible scene needs
 
-Do not move all delegate logic into SwiftUI views. Use the app/scene delegate reference for UIKit lifecycle responsibilities and the SDK reference for vendor startup policy. In this SwiftUI reference, focus on whether bridging creates hidden eager work or duplicate startup paths.
+Prefer scene construction that installs a minimal valid root UI and moves secondary work behind explicit readiness or feature activation.
 
-## First-Screen Readiness in SwiftUI
+Do not assume a single global scene. SwiftUI apps can have multiple windows or scene instances depending on platform and configuration.
 
-For launch review, distinguish between rendering a valid first shell and completing all app data loading.
+## Root View and Root Model Setup
 
-A valid first SwiftUI shell may contain:
+Root views are often cheap as values, but their initialization and model ownership can still trigger launch work.
 
-- a local session decision
-- a locked, login, onboarding, loading, or main-shell route
-- cached first-screen data
-- placeholder or skeleton content
-- disabled controls with clear loading state
-- minimal navigation chrome
-- a small state machine that represents startup progress
+Review root-level use of:
 
-It usually does not need to contain:
+- `@StateObject`
+- `@State`
+- `@Observable`
+- `ObservableObject`
+- `@EnvironmentObject`
+- `@Environment`
+- `modelContainer`
+- dependency containers
+- service locators
+- composition roots
+- routers and coordinators
+- first-screen view models
 
-- refreshed remote configuration when safe defaults exist
-- fully synchronized user data
-- secondary tab data
-- personalized recommendations
-- warmed caches for later screens
-- feature modules not visible on the first screen
-- cleanup, compaction, analytics upload, or maintenance work
+High-risk patterns:
 
-Be careful with authentication, privacy, and routing. If the first screen must not be shown until a local security decision is made, keep that decision launch-critical but make it as small and local as possible. Do not replace required security or compliance gates with a visual shortcut.
+- root model creates the entire app graph
+- root model opens database or keychain synchronously
+- root model starts network or remote config immediately
+- root model creates view models for many tabs or flows
+- root view initializes feature modules not needed for first frame
+- root state depends on session, routing, SDKs, or persistence that could be partial
+- root environment contains many eager objects because it is convenient
 
-If deep links, push notifications, shortcuts, widgets, or universal links can determine the first route, classify the minimum routing state as launch-critical. Defer only the work that is not required to choose and display the correct initial destination.
+Prefer a small launch state model that can decide or display the first valid UI, then let features own their own setup.
 
-## Review Questions
+Do not split root state blindly. Preserve ownership and lifetime semantics.
 
-When reviewing SwiftUI launch code, ask:
+## Environment Injection
 
-1. What is the first SwiftUI view that must become visible?
-2. Which state is strictly required to choose that view?
-3. Which app stored properties and initializers run before that view can be created?
-4. Which root models are created eagerly, and what do their initializers do?
-5. Which environment values are computed eagerly?
-6. Which services are resolved before the first visible shell?
-7. Which `.task`, `.onAppear`, or `scenePhase` callbacks start during launch or immediately after the first scene appears?
-8. Can this work run more than once because of SwiftUI lifecycle behavior?
-9. Is startup work split into launch-critical, first-interaction, post-visible, and feature-lazy phases?
-10. Is any UIKit delegate bridge duplicating work already started from SwiftUI?
-11. Does the first screen require full app readiness, or only a narrow subset of state?
-12. What measurement will prove that the change improves first frame or early responsiveness?
+Environment injection can hide broad launch work.
 
-## Common Findings and Recommended Direction
+Review:
 
-### Heavy App Initialization
+- `.environment(...)`
+- `.environmentObject(...)`
+- custom environment keys
+- persistence containers
+- model containers
+- resolver/container injection
+- global app state injection
+- feature service injection at the root
 
-Finding:
+High-risk patterns:
 
-- The app type constructs a full graph or starts services before any scene can render.
+- building all environment values before the first visible UI
+- injecting many feature-specific objects globally
+- resolving dependencies while constructing environment values
+- using environment as a service locator for the entire app graph
+- making the first screen depend on all environment objects even when it only needs one small state
 
-Recommended direction:
+Prefer:
 
-- Keep the app type minimal.
-- Create only launch-critical state.
-- Move secondary startup to explicit async phases, post-visible phases, or feature-owned lazy initialization.
-- Use the SDK and orchestration references when the work involves vendor startup or many ordered launch steps.
+- lightweight environment values
+- factories or descriptors for feature-specific services
+- feature-local injection
+- lazy service creation at feature boundaries
+- small root state that only supports initial routing and first-frame UI
 
-### Heavy Root Observable Model
+If environment setup represents a large ordered dependency graph, use this file to identify the SwiftUI entry point, then route graph design to `launch-orchestration-and-dependency-graph.md`.
 
-Finding:
+## Lifecycle-Bound Work
 
-- The root model performs I/O, data fetches, migrations, broad subscription setup, or service registration in `init`.
+SwiftUI lifecycle-bound work can start early enough to affect launch.
 
-Recommended direction:
+Review:
 
-- Make construction cheap.
-- Move work to explicit methods.
-- Start only the subset required for first-screen correctness.
-- Use cached, placeholder, or loading state when product rules allow it.
-- Keep root observable dependencies narrow.
+- `.task`
+- `.task(id:)`
+- `.onAppear`
+- `.onChange`
+- `scenePhase` handlers
+- root view model `init`
+- root view model async methods started from modifiers
+- first-screen `.task` or `.onAppear`
+- tab or navigation root lifecycle modifiers
 
-### Root `.task` Does Too Much
+Classify lifecycle-bound work by necessity:
 
-Finding:
+- required before first frame
+- required before first interaction
+- useful soon after launch
+- resume-only
+- feature-specific and lazy
+- background maintenance
 
-- A root `.task` starts many operations immediately, including work not needed for the first screen.
+Work that is not required before first frame or first interaction should not compete with launch-critical work unless there is a correctness reason.
 
-Recommended direction:
+## .task, .onAppear, and scenePhase
 
-- Split the task into smaller phases.
-- Keep the first phase short and cancellable.
-- Move feature-specific operations to feature entry points.
-- Avoid long main-actor sections.
-- Validate early responsiveness, not only time to first frame.
+Do not assume `.task` is harmless because it is async.
 
-### `.onAppear` Used as a Launch Hook
+`.task` can start while the root scene is becoming visible, compete for CPU, I/O, storage, locks, or main-actor time, trigger observable updates, and affect the first meaningful interaction.
 
-Finding:
+Review `.task` and `.task(id:)` for:
 
-- `.onAppear` starts one-time app setup and can run more than once.
+- network calls
+- database access
+- keychain access
+- JSON or plist decoding
+- image decoding
+- SDK startup
+- dependency resolution
+- feature warmups
+- task fan-out
+- missing cancellation
+- repeated execution because the identity changes
+- main-actor work after an async call
+- updates to broad observable state
 
-Recommended direction:
+Review `.onAppear` for:
 
-- Move one-time session setup to an explicit app/session model with idempotency.
-- Use `.task` for cancellable view-bound async work.
-- Guard repeated work when repetition would be incorrect or expensive.
+- repeated execution
+- duplicated work already started in `.task`
+- work triggered by container/root views instead of feature views
+- synchronous work before the UI becomes responsive
+- observer registration with side effects
 
-### `scenePhase` Refresh Causes Resume Jank
+Review `scenePhase` for:
 
-Finding:
+- treating foreground resume as cold launch
+- refreshing too much data immediately on `.active`
+- duplicating launch work when returning from background
+- restarting tasks already owned by root views
+- running heavy work while the first scene is trying to become interactive
+- missing idempotency and cancellation
 
-- The app refreshes large state on every `.active` transition.
+Prefer explicit readiness and idempotency:
 
-Recommended direction:
+- a task should know why it runs
+- a task should know whether it is launch, resume, or feature work
+- a task should have cancellation behavior
+- repeated lifecycle events should not restart expensive work unnecessarily
+- early tasks should not update broad root state if a smaller model can own the result
 
-- Separate launch from resume.
-- Check freshness before refresh.
-- Make resume work cancellable and priority-aware.
-- Do not block early interaction on noncritical refresh.
+## Delegate Bridging in SwiftUI Lifecycle Apps
 
-### Environment Injection Builds Too Much
+SwiftUI apps may still use UIKit launch hooks through:
 
-Finding:
+```swift
+@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+```
 
-- Root environment injection creates a complete dependency graph or many environment objects before the first screen.
+Treat the adapted delegate as part of the launch path when it performs startup work.
 
-Recommended direction:
+Review:
 
-- Inject lightweight handles, factories, or launch-specific dependencies.
-- Create feature dependencies when the feature becomes visible.
-- Avoid storing full app graphs in the environment unless construction is cheap and measured.
+- `application(_:didFinishLaunchingWithOptions:)`
+- `application(_:configurationForConnecting:options:)`
+- notification/deep-link handling
+- SDK initialization
+- push registration
+- background task registration
+- app-wide dependency setup
+- duplicate work also performed in SwiftUI `App.init`, root `.task`, `.onAppear`, or `scenePhase`
 
-### Delegate Bridge Duplicates Startup
+Use this file to identify delegate bridging from SwiftUI.
 
-Finding:
+Use `appdelegate-scenedelegate-and-first-frame.md` to review the delegate implementation itself.
 
-- Startup is triggered from both `@UIApplicationDelegateAdaptor` and SwiftUI root lifecycle hooks.
+Do not assume SwiftUI lifecycle removes AppDelegate launch cost when an adaptor is present.
 
-Recommended direction:
+## First-Frame and Early Responsiveness
 
-- Assign one owner for each startup responsibility.
-- Keep delegate-owned work limited to responsibilities that belong in the app delegate path.
-- Keep view-owned work tied to visible UI or feature lifecycle.
-- Add idempotency where multiple lifecycle events can legitimately request the same operation.
+A SwiftUI app can draw quickly and still feel slow if early tasks block the main actor, storage, CPU, or first interaction.
 
-## Patch Guidance
+Review:
 
-When proposing code changes, prefer small, behavior-preserving patches:
+- whether the root UI can render with minimal state
+- whether first-screen state can be cached, placeholder-based, or partial
+- whether broad observable updates immediately invalidate the root hierarchy
+- whether the first screen appears but then blocks on a required task
+- whether post-first-frame tasks compete with initial interaction
+- whether the app shows an interactive-looking UI before it is actually usable
 
-- split app-type startup into critical and noncritical phases
-- replace eager root service construction with lazy factories
-- move heavy root model work from `init` to explicit async methods
-- add idempotency to startup methods triggered by view lifecycle
-- move feature-specific startup from the root shell to feature entry points
-- reduce the first root environment to launch-critical dependencies
-- add lightweight app-owned signposts around SwiftUI startup phases when measurement is missing
+Prefer:
 
-Do not patch by:
+- minimal first-frame state
+- explicit loading or disabled states
+- cached or placeholder first-screen content
+- feature-owned loading
+- bounded post-first-frame work
+- signposts around root setup and first interaction readiness
 
-- moving work into a detached task without ownership, cancellation, priority, and failure reasoning
-- replacing required security, auth, privacy, or routing decisions with unsafe placeholders
-- changing SwiftUI ownership wrappers without checking lifecycle semantics
-- hiding work behind a different initializer or singleton
-- pushing all work to the background without considering first interaction correctness
-- using `MainActor.run` as a blanket fix for isolation problems created by moved startup work
+Do not hide important launch latency by moving everything after first draw if the app immediately blocks the user.
 
-## Validation Handoff
+## Duplicate Startup Paths
 
-This reference can recommend what to validate, but tool-specific details belong in `metrics-instruments-xctest-metrickit.md`.
+SwiftUI launch code often duplicates work across multiple lifecycle surfaces.
 
-For SwiftUI launch changes, validation should answer:
+Check for duplicate or competing startup work across:
 
-- Did the first visible app frame become earlier?
-- Did early responsiveness improve, stay the same, or regress?
-- Did root lifecycle-bound work move out of the critical path or merely shift jank later?
-- Did the change accidentally duplicate work on resume, scene recreation, deep link launch, or notification launch?
-- Did cancellation and idempotency still behave correctly?
-- Did authenticated, unauthenticated, first-install, returning-user, upgraded-app, deep-link, and notification launches still route correctly?
-- Did the change preserve SwiftUI state ownership semantics?
+- `App.init`
+- `WindowGroup`
+- root view initialization
+- root model initialization
+- `@UIApplicationDelegateAdaptor`
+- `.task`
+- `.onAppear`
+- `scenePhase`
+- dependency containers
+- SDK facades
+- first-screen view models
+
+Common symptoms:
+
+- first launch and resume both trigger the same heavy setup
+- `.task` and `.onAppear` start the same request
+- delegate adaptor initializes an SDK and root view model initializes it again
+- root model builds services already built by a composition root
+- scenePhase `.active` refreshes data already loading from root `.task`
+- multiple scenes repeat app-wide bootstrap work
+
+Prefer explicit ownership. Each startup responsibility should have one owner, one trigger, idempotency, cancellation, and failure behavior.
+
+## What the Agent Can Inspect
+
+When repository access is available, inspect concrete SwiftUI launch-path code instead of giving generic advice.
+
+Search for SwiftUI lifecycle entry points:
+
+```sh
+rg "@main|struct .*: App|WindowGroup|Scene" .
+```
+
+Search for `App.init` and delegate bridging:
+
+```sh
+rg "init\(\).*App|@UIApplicationDelegateAdaptor|UIApplicationDelegateAdaptor|UIApplicationDelegate" .
+```
+
+Search for eager root state and environment injection:
+
+```sh
+rg "@StateObject|@State|@Observable|ObservableObject|@EnvironmentObject|\.environment\(|\.environmentObject\(" .
+```
+
+Search for persistence and dependency containers at the root:
+
+```sh
+rg "modelContainer|container|resolver|dependencies|graph|ServiceLocator|Assembler|CompositionRoot|make.*Container|build.*Graph" .
+```
+
+Search for lifecycle-bound startup work:
+
+```sh
+rg "\.task\s*\{|\.task\s*\(|\.onAppear\s*\{|scenePhase|onChange\s*\(of:.*scenePhase" .
+```
+
+Search for expensive work near SwiftUI launch surfaces:
+
+```sh
+rg "Data\(|contentsOf:|FileManager|Keychain|SecItem|JSONDecoder|PropertyListDecoder|URLSession|migrate|openDatabase|resolveAll|registerAll|wait\(|semaphore|sync\(" .
+```
+
+Use search results as leads, not proof. Confirm whether matched code runs before first frame, before first interaction, on resume, or only after a later feature appears.
+
+The agent can:
+
+- trace SwiftUI launch path from `@main App` to first visible view
+- identify heavy app stored properties and `App.init` work
+- identify heavy root model construction
+- identify eager environment and dependency setup
+- classify `.task`, `.onAppear`, `onChange`, and `scenePhase` work by launch necessity
+- detect duplicate startup paths between SwiftUI lifecycle code and delegate adaptors
+- propose smaller launch state or feature-owned setup when safe
+- recommend signposts around SwiftUI root setup and first-screen readiness
+
+The agent cannot reliably:
+
+- treat every `.task` as post-launch
+- treat every SwiftUI state object as launch cost
+- change root state ownership safely without understanding lifetime and identity
+- defer auth, privacy, security, routing, or compliance work without product context
+- prove first-frame timing without measurement
+- decide SDK startup policy without SDK-specific constraints
+
+## Safe Patch Heuristics
+
+When the agent is allowed to edit code, prefer small, reversible changes.
+
+Good patch candidates:
+
+- move clearly noncritical work out of `App.init`
+- split root model into minimal launch state and feature-owned state
+- replace eager root environment object construction with lightweight factories when call sites tolerate laziness
+- move noncritical `.task` work behind explicit post-first-frame, post-first-interaction, or feature-specific triggers
+- add idempotency guards to `.task`, `.onAppear`, `scenePhase`, and delegate-adaptor work
+- prevent duplicate work across `.task`, `.onAppear`, `scenePhase`, and delegate callbacks
+- make the first screen show cached, placeholder, loading, or disabled state while secondary work continues
+- move feature-specific environment injection closer to the feature boundary
+- add signposts around SwiftUI root setup and first-screen readiness
+
+Risky patch candidates requiring extra care:
+
+- moving authentication, privacy lock, security, payment, fraud, or compliance routing out of launch
+- changing `@UIApplicationDelegateAdaptor` behavior without checking delegate responsibilities
+- changing root state ownership from `@StateObject`, `@State`, `@Observable`, or environment without understanding lifetime
+- removing environment objects used by deep links, notifications, routing, or restoration
+- making `.task` work lazy when visible UI has no loading, failure, or retry state
+- backgrounding work that immediately updates main actor state or competes with first interaction
+- moving persistence or model container setup without checking first-screen data needs
+- changing multi-scene behavior without idempotency checks
+
+If correctness is uncertain, recommend instrumentation or decomposition first, then behavior-changing optimization after evidence is available.
+
+## Review Checklist
+
+Use this checklist when reviewing SwiftUI launch code.
+
+- [ ] Is this truly launch or early responsiveness rather than general SwiftUI performance?
+- [ ] Does the app use SwiftUI lifecycle, UIKit lifecycle, or a hybrid setup?
+- [ ] Are `App` stored properties cheap?
+- [ ] Is `App.init` free of broad synchronous setup?
+- [ ] Does `WindowGroup` construct only the UI needed for the first visible scene?
+- [ ] Are root models minimal and cheap to create?
+- [ ] Are environment values lightweight?
+- [ ] Are feature-specific services injected closer to feature boundaries?
+- [ ] Does `.task` work have a launch, resume, or feature-specific reason?
+- [ ] Are `.task`, `.onAppear`, and `scenePhase` handlers idempotent?
+- [ ] Is duplicate startup work avoided across delegate adaptor and SwiftUI lifecycle code?
+- [ ] Can the first screen render with partial or cached state?
+- [ ] Does early async work avoid blocking first interaction?
+- [ ] Are auth, privacy, security, routing, restoration, and compliance requirements preserved?
+- [ ] Is the recommendation connected to a validation plan?
+
+## Agent Guidance
+
+When applying this reference, produce a SwiftUI launch-oriented review:
+
+```markdown
+### SwiftUI launch path
+Describe the path from `@main App` to the first visible view.
+
+### Launch-critical SwiftUI work
+Name work in `App.init`, `Scene`, `WindowGroup`, root view/model setup, environment injection, delegate adaptor, `.task`, `.onAppear`, or `scenePhase` that appears to affect first frame or first interaction.
+
+### Necessity classification
+Classify work as first-frame, first-interaction, soon-after-launch, resume-only, feature-lazy, or background maintenance.
+
+### Duplicate startup paths
+Identify work repeated across SwiftUI lifecycle, delegate adaptor, root models, `.task`, `.onAppear`, or `scenePhase`.
+
+### Recommended changes
+Suggest the smallest safe changes: reduce eager root setup, split launch state, move feature work later, add idempotency, or add explicit readiness.
+
+### Correctness risks
+Call out auth, routing, privacy, security, state restoration, multi-scene, persistence, SDK, or compliance concerns.
+
+### Validation
+Explain how to verify first-frame and early responsiveness with trace, signposts, XCTest launch metrics, manual interaction checks, or production data.
+```
+
+Keep recommendations tied to evidence. If the timing boundary is unclear, label the finding as a hypothesis and recommend measurement.
 
 ## Boundary With Other References
 
-This reference should answer:
+Use this reference for SwiftUI lifecycle work that affects launch, first frame, or early responsiveness.
 
-- Is SwiftUI app/root lifecycle code doing too much during launch?
-- Is root observable state cheap enough to construct before first frame?
-- Are `.task`, `.onAppear`, and `scenePhase` being used with correct lifecycle assumptions?
-- Is SwiftUI-to-UIKit delegate bridging duplicating startup work?
-- Can the first SwiftUI shell render without full app-wide readiness?
+Read `references/launch-taxonomy-and-targets.md` when the issue involves:
 
-This reference should not answer:
+- cold, warm, prewarmed, resume, first install, or update launch terminology
+- launch target selection
+- measurement scenario classification
+- whether two numbers are comparable
 
-- how dyld loads frameworks or runs static initializers
-- whether a module should be static, dynamic, or mergeable
-- how to restructure UIKit app/scene delegate code
-- how to design a multi-step launch scheduler
-- how to configure XCTest launch metrics or interpret MetricKit payloads
-- how to optimize general SwiftUI list, animation, diffing, or scrolling performance outside launch
+Read `references/pre-main-dyld-and-static-initializers.md` when the issue involves:
+
+- dyld
+- pre-main work
+- `+load`
+- `+initialize`
+- constructor functions
+- Objective-C categories
+- runtime registration
+- static initialization before SwiftUI lifecycle begins
+
+Read `references/linking-strategy.md` when the issue involves:
+
+- dynamic frameworks
+- static libraries
+- mergeable libraries
+- modularization and launch-time linking trade-offs
+- binary layout
+- order-file considerations
+
+Read `references/launch-orchestration-and-dependency-graph.md` when the issue involves:
+
+- root SwiftUI setup resolving a large ordered startup graph
+- critical path analysis
+- startup step dependencies
+- hidden ordering
+- safe parallelism
+- failure policy
+- dependency-chain optimization
+
+Read `references/appdelegate-scenedelegate-and-first-frame.md` when the issue involves:
+
+- implementation details inside `UIApplicationDelegate`
+- implementation details inside `UISceneDelegate`
+- window setup
+- root view controller creation
+- first-frame readiness in UIKit lifecycle code
+- main-thread lifecycle work
+
+Read `references/third-party-sdks-at-launch.md` when the issue involves:
+
+- analytics
+- crash reporting
+- ads
+- attribution
+- remote config
+- push
+- feature flags
+- security SDKs
+- vendor initialization strategy
+
+Read `references/metrics-instruments-xctest-metrickit.md` when the issue involves:
+
+- Instruments
+- Time Profiler
+- signposts
+- XCTest launch metrics
+- MetricKit
+- Xcode Organizer
+- CI baselines
+- production monitoring
+
+Do not read all references by default.
