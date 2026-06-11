@@ -1,686 +1,303 @@
 # ARC and Ownership
 
-Use this reference when a review involves ARC traffic, object lifetime, reference cycles, closure captures, weak/unowned references, copy-on-write storage, Objective-C bridging, or ownership-sensitive performance issues.
+Use this reference when the task involves retain/release traffic, closure captures, weak/unowned references, object lifetime, reference cycles, copy-on-write ownership, Objective-C bridging lifetime, or ownership-sensitive performance issues.
 
-The goal is not to remove ARC from Swift code. The goal is to identify when reference ownership is contributing to a measured cost or correctness issue, then choose the smallest change that preserves the intended lifetime model.
+The goal is not to remove ARC from Swift code. The goal is to identify whether ownership is causing a correctness issue, memory growth, or measured runtime cost, then recommend the smallest safe change that preserves the intended lifetime model.
+
+## Contents
+
+- [Core model](#core-model)
+- [When to use this reference](#when-to-use-this-reference)
+- [What to inspect first](#what-to-inspect-first)
+- [Ownership semantics](#ownership-semantics)
+- [Closure captures and cycles](#closure-captures-and-cycles)
+- [ARC traffic in hot paths](#arc-traffic-in-hot-paths)
+- [Value types, COW, and hidden ownership](#value-types-cow-and-hidden-ownership)
+- [Objective-C bridging and autorelease behavior](#objective-c-bridging-and-autorelease-behavior)
+- [Observed object lifetime](#observed-object-lifetime)
+- [Evidence to check](#evidence-to-check)
+- [Decision rules](#decision-rules)
+- [Common refactor patterns](#common-refactor-patterns)
+- [Validation](#validation)
+- [Output guidance](#output-guidance)
 
 ## Core model
 
 ARC manages the lifetime of reference-counted objects.
 
-Common ARC-managed or ARC-related cases:
+ARC-related cost can appear through:
 
-* class instances
-* actor instances
-* closure capture contexts
-* reference-backed standard library storage
-* Objective-C and Core Foundation bridged objects
-* type-erased wrappers that store references
-* values that contain references or copy-on-write buffers
+- class and actor instances;
+- closure capture contexts;
+- reference-backed standard library storage;
+- type-erased wrappers that store references;
+- Objective-C and Core Foundation bridging;
+- values that contain copy-on-write storage.
 
-Value types are not reference-counted as values, but they can contain fields that participate in ARC.
+Value types are not reference-counted as values, but their stored properties can carry ownership cost. `String`, `Array`, `Dictionary`, `Set`, and `Data` may use reference-backed storage. A `struct` can therefore participate in ARC traffic even when the source has no explicit class.
 
-Avoid simplistic rules such as:
+Use this model:
 
-* ARC is always the bottleneck.
-* value types have no ARC cost.
-* `weak` is faster or safer by default.
-* `unowned` is a performance optimization.
-* `[weak self]` should be used in every closure.
-* deinitialization timing is a stable correctness mechanism.
-* replacing classes with structs automatically removes ownership cost.
+1. 1Ownership defines lifetime.
+2. 2ARC implements that lifetime.
+3. 3ARC traffic matters when it affects correctness, memory growth, hot-path CPU work, locality, or responsiveness.
+4. 4Ownership changes are semantic changes first and performance changes second.
 
-ARC cost matters when retain/release traffic is frequent, appears in a hot path, causes memory pressure, extends object lifetime unexpectedly, or creates retained object graphs that outlive their intended scope.
+Avoid simple rules such as:
+
+- ARC is always the bottleneck.
+- Value types have no ownership cost.
+- `weak` is faster or safer by default.
+- `unowned` is a performance optimization.
+- `[weak self]` belongs in every closure.
+- Replacing classes with structs automatically removes ownership cost.
+- Exact `deinit` timing is a stable correctness mechanism.
+
+## When to use this reference
+
+Use this file for questions about:
+
+- retain/release traffic in a hot path;
+- closure capture lists and captured object lifetime;
+- strong reference cycles;
+- `weak`, `unowned`, or `unowned(unsafe)`;
+- task, timer, subscription, observer, or callback ownership;
+- memory growth caused by retained object graphs;
+- copy-on-write storage and value types that hide references;
+- Foundation or Objective-C bridging lifetime;
+- optimized SIL signs of ARC traffic.
+
+Prefer another reference when the main issue is different:
+
+- `allocation-and-layout.md` — storage location, object layout, closure boxes, existential storage, or unexpected heap allocation.
+- `dispatch-and-specialization.md` — dynamic dispatch, witness dispatch, inlining, or specialization.
+- `existentials-generics-opaque-types.md` — `any`, `some`, generics, type erasure, or heterogeneous collections.
+- `cow-and-large-values.md` — large-value copying, mutation strategy, collection buffers, or custom COW implementation.
+- `unsafe-swift.md` — pointers, `Unmanaged`, memory binding, aliasing, or unsafe lifetime boundaries.
 
 ## What to inspect first
 
 Before proposing ownership changes, identify:
 
-1. Is there a correctness issue, a memory growth issue, or a runtime performance issue?
-2. Is the object graph retained longer than intended?
-3. Is there a strong reference cycle?
-4. Is ARC traffic visible in Time Profiler or optimized SIL?
-5. Are closures capturing more state than necessary?
-6. Is a value type hiding reference-backed storage?
-7. Is copy-on-write storage being copied or retained repeatedly?
-8. Is Objective-C bridging or autorelease behavior involved?
-9. Would changing ownership semantics alter program behavior?
-10. How will the change be validated?
+1. 1Is the issue correctness, memory growth, CPU cost, or only a theoretical concern?
+2. 2Which object or value is retained longer than intended?
+3. 3Who owns it intentionally?
+4. 4Is there a strong reference cycle?
+5. 5Is the closure escaping, stored, or long-lived?
+6. 6Does the closure need the whole owner or only a dependency?
+7. 7Is ARC traffic visible in Time Profiler, Allocations, Memory Graph, or optimized SIL?
+8. 8Is COW storage copied or retained repeatedly?
+9. 9Is Objective-C bridging or autorelease behavior involved?
+10. 10Would changing ownership alter program behavior?
+11. 11How will the change be validated?
 
-Do not change ownership only because source code looks reference-heavy. First determine whether lifetime or ARC traffic is relevant to the problem.
+Do not change ownership only because code looks reference-heavy. Runtime ownership advice is useful only when it preserves semantics and addresses a real lifetime or performance signal.
 
-## Strong ownership
+## Ownership semantics
 
-A strong reference keeps an object alive.
+### Strong ownership
 
-Use strong references when:
+A strong reference keeps an object alive. Use strong ownership when the current object requires another object to function correctly.
 
-* the owner is responsible for keeping the object alive
-* the lifetime dependency is direct and intentional
-* the reference is part of the object's required state
-* the object should not disappear while it is being used
+Prefer strong references for required dependencies, direct ownership relationships, state that is part of the owner invariant, and objects that must not disappear while the owner is alive.
 
-Example:
+Do not weaken required dependencies to reduce retain counts. That turns a clear invariant into optional state and can introduce silent failures.
 
-```swift
-final class PlaybackController {
-    private let engine: AudioEngine
-    private let library: MediaLibrary
-
-    init(engine: AudioEngine, library: MediaLibrary) {
-        self.engine = engine
-        self.library = library
-    }
-
-    func start(track: TrackID) throws {
-        let file = try library.file(for: track)
-        try engine.play(file)
-    }
-}
-```
-
-`PlaybackController` strongly owns the dependencies it needs to function. Replacing these references with `weak` would make the object graph less reliable and could introduce unexpected nil states.
-
-Review rule:
-
-* Use strong ownership when the current object depends on another object for correct operation.
-* Do not weaken ownership just to reduce retain counts.
-
-## Weak references
+### Weak ownership
 
 A weak reference does not keep an object alive and becomes `nil` when the referenced object is deallocated.
 
-Use `weak` when:
+Use `weak` when the referenced object may disappear independently, `nil` is a valid state, the relationship is observational/back-pointing, or the relationship would otherwise create a cycle.
 
-* the referenced object may disappear independently
-* `nil` is a valid state
-* the relationship would otherwise create a cycle
-* the reference is naturally back-pointing or observational
-* the owner should not extend the lifetime of the referenced object
+Common examples: delegates, parent pointers, coordinator back references, observer relationships, and callbacks where the owner may disappear before the callback fires.
 
-Common examples:
+Recommend `weak` for lifetime semantics, not for speed.
 
-* delegates
-* parent pointers
-* view-to-coordinator back references
-* observer relationships
-* callbacks where the owner may disappear before the callback fires
+### Unowned ownership
 
-Example:
+An unowned reference does not keep an object alive and is expected to always refer to a valid object when accessed.
 
-```swift
-protocol DownloadCellDelegate: AnyObject {
-    func downloadCellDidTapRetry(_ cell: DownloadCell)
-}
+Use `unowned` only when the referenced object is guaranteed to outlive the reference, `nil` is not meaningful, optional access would misrepresent the model, and the lifetime relationship is simple and easy to prove.
 
-final class DownloadCell {
-    weak var delegate: DownloadCellDelegate?
+This is valid only if the child can never outlive the parent. If the child can be detached, cached, moved, or used after the parent is gone, use a different ownership model.
 
-    func retryButtonTapped() {
-        delegate?.downloadCellDidTapRetry(self)
-    }
-}
+Avoid `unowned(unsafe)` unless the code is a carefully isolated low-level boundary with documented lifetime guarantees and tests.
+
+## Closure captures and cycles
+
+Closure capture lists define what the closure retains and how long those values may stay alive.
+
+First ask whether the closure is non-escaping, escaping but short-lived, stored by the owner, stored by another object retained by the owner, retained by a task/timer/display link/subscription/observer, or executed after cancellation, dismissal, or teardown.
+
+Use `[weak self]` when a closure may outlive `self` and should not keep `self` alive.
+
+Do not use `[weak self]` reflexively when the closure is non-escaping, executed immediately, should keep the object alive until completion, would silently drop required work if `self` disappears, or has no cycle/lifetime-extension risk.
+
+Prefer narrow captures when the closure only needs dependencies, not owner identity. For example, capture `encoder` and `store` instead of the entire exporter when the closure does not need exporter identity.
+
+Common cycle chains:
+
+```text
+Owner -> stored closure -> captured owner
+Owner -> subscription token -> subscription closure -> captured owner
+Owner -> task handle -> task closure -> captured owner
+Parent -> child -> delegate/closure -> parent
 ```
 
-The cell should not own its delegate. The delegate may disappear, so `weak` and optional access model the relationship correctly.
+Break the smallest correct edge: make a back reference `weak`, capture `self` weakly, capture a dependency instead of `self`, invalidate a timer/observer/subscription, clear a stored closure, or move callback ownership to an object with a clearer lifetime.
 
-Review rule:
-
-* Recommend `weak` for lifetime semantics, not for speed.
-* Do not use `weak` when the referenced object must remain alive for the current object to work.
-
-## Unowned references
-
-An unowned reference does not keep an object alive and is expected to always refer to a valid object while it is accessed.
-
-Use `unowned` only when:
-
-* the referenced object is guaranteed to outlive the reference
-* `nil` is not a meaningful state
-* a weak optional would misrepresent the invariant
-* the ownership relationship is simple and easy to prove
-
-Example:
-
-```swift
-final class Document {
-    private(set) var pages: [Page] = []
-
-    func addPage(number: Int) {
-        pages.append(Page(number: number, document: self))
-    }
-}
-
-final class Page {
-    let number: Int
-    unowned let document: Document
-
-    init(number: Int, document: Document) {
-        self.number = number
-        self.document = document
-    }
-}
-```
-
-This is valid only if a `Page` can never outlive its `Document`. If pages can be detached, cached, moved elsewhere, or used after the document is gone, `unowned` is unsafe.
-
-Review rule:
-
-* Use `unowned` for proven lifetime invariants.
-* Do not use `unowned` as a performance substitute for `weak`.
-* If the lifetime relationship is not obvious, prefer `weak` or redesign ownership.
-
-Avoid `unowned(unsafe)` unless the code is a carefully isolated low-level boundary with documented lifetime guarantees.
-
-## Reference cycles
-
-A strong reference cycle occurs when objects keep each other alive indefinitely.
-
-Common patterns:
-
-* parent strongly owns child, child strongly owns parent
-* object stores a closure that captures the object strongly
-* timer/display link/notification/token retains a callback that captures owner
-* coordinator retains screen, screen retains coordinator through closure
-* task handle retained by owner, task closure captures owner
-
-Example:
-
-```swift
-final class GalleryPresenter {
-    private var onSelection: ((ImageID) -> Void)?
-
-    func configure() {
-        onSelection = { id in
-            self.openImage(id)
-        }
-    }
-
-    private func openImage(_ id: ImageID) {
-        // ...
-    }
-}
-```
-
-`GalleryPresenter` stores the closure and the closure captures `self`. This can create a cycle.
-
-A safer version:
-
-```swift
-final class GalleryPresenter {
-    private var onSelection: ((ImageID) -> Void)?
-
-    func configure() {
-        onSelection = { [weak self] id in
-            self?.openImage(id)
-        }
-    }
-
-    private func openImage(_ id: ImageID) {
-        // ...
-    }
-}
-```
-
-Use `[weak self]` when the closure may outlive `self` and `self` should not be kept alive by the closure.
-
-Do not use `[weak self]` reflexively when:
-
-* the closure is non-escaping
-* the closure is executed immediately
-* the closure should keep the object alive for the operation
-* losing `self` would silently drop required work
-* there is no ownership cycle or lifetime extension problem
-
-## Narrowing closure captures
-
-Closure capture lists can be used to capture specific dependencies instead of the whole owner.
-
-Example:
-
-```swift
-final class ReceiptExporter {
-    private let encoder: ReceiptEncoder
-    private let store: ReceiptStore
-    private let logger: Logger
-
-    init(encoder: ReceiptEncoder, store: ReceiptStore, logger: Logger) {
-        self.encoder = encoder
-        self.store = store
-        self.logger = logger
-    }
-
-    func makeExportAction() -> (Receipt) throws -> URL {
-        let encoder = encoder
-        let store = store
-
-        return { receipt in
-            let data = try encoder.encode(receipt)
-            return try store.save(data)
-        }
-    }
-}
-```
-
-The closure does not retain `ReceiptExporter` or unrelated dependencies such as `logger`. It retains only the objects required by the action.
-
-Review questions:
-
-* Does the closure need `self`?
-* Would capturing a specific dependency better express the lifetime?
-* Would `[weak self]` silently skip required work?
-* Is the closure stored by `self`, creating a cycle?
-* Is the closure created repeatedly in a hot path?
-* Is the closure crossing an async or actor boundary?
-
-## Escaping vs non-escaping closures
-
-Non-escaping closures usually do not create long-lived ownership problems because they cannot outlive the call.
-
-Escaping closures can extend the lifetime of captured objects.
-
-Look for escaping closures in:
-
-* stored callbacks
-* async completion handlers
-* task closures
-* notification handlers
-* timers and display links
-* Combine/Rx subscriptions
-* UI event handlers stored by controls
-* animation completion handlers
-* operation queues and dispatch queues
-
-Example:
-
-```swift
-final class SearchController {
-    private let service: SearchService
-    private var latestRequest: Task<Void, Never>?
-
-    init(service: SearchService) {
-        self.service = service
-    }
-
-    func search(query: String) {
-        latestRequest?.cancel()
-
-        latestRequest = Task { [service] in
-            let results = try? await service.results(for: query)
-            await MainActor.run {
-                // update UI-facing state elsewhere
-                _ = results
-            }
-        }
-    }
-}
-```
-
-Capturing `service` instead of `self` prevents the task from retaining the whole controller. This is useful when the task does not need the controller's identity.
-
-Review rule:
-
-* A task retains the closure and its captures while it is running.
-* This is not automatically a cycle.
-* It becomes a cycle when the owner stores the task and the task strongly captures the owner, or when the task is long-lived and unintentionally extends the owner lifetime.
+Do not break cycles by weakening required dependencies. Fix the relationship that is actually cyclic.
 
 ## ARC traffic in hot paths
 
-ARC traffic becomes important when retain/release operations are frequent enough to show up in a hot path.
+ARC traffic becomes important when retain/release operations are frequent enough to affect a measured hot path.
 
 Common sources:
 
-* arrays of class instances processed in tight loops
-* repeated creation of short-lived reference wrappers
-* closure creation inside loops
-* type-erased wrappers around reference-heavy objects
-* storing and removing callbacks frequently
-* bridging Swift values to Objective-C repeatedly
-* reference-backed value types copied across many layers
-* passing class references through generic or existential abstractions that the optimizer cannot simplify
+- arrays of class instances processed in tight loops;
+- repeated creation of short-lived reference wrappers;
+- closure creation inside loops;
+- escaping closures created during scrolling, parsing, rendering, or search;
+- type-erased wrappers around reference-heavy objects;
+- repeated bridging between Swift and Objective-C types;
+- reference-backed value types copied through many layers;
+- generic or existential abstraction that prevents optimization from removing ownership traffic.
 
-Example:
+An array of reference boxes in a tight loop can be fine. If the loop is extremely hot and profiling shows ARC or pointer-chasing cost, a compact value representation may improve locality and reduce ownership traffic. Do not make this rewrite unless the representation still matches the domain and the cost matters.
 
-```swift
-final class ScoreBox {
-    let value: Int
-
-    init(value: Int) {
-        self.value = value
-    }
-}
-
-func totalScore(_ scores: [ScoreBox]) -> Int {
-    var total = 0
-
-    for score in scores {
-        total += score.value
-    }
-
-    return total
-}
-```
-
-This may be perfectly fine. If this loop is extremely hot, an array of reference objects may show ARC and pointer-chasing cost. A compact value representation could improve locality and reduce ownership traffic.
-
-A value-oriented representation:
-
-```swift
-struct Score {
-    var value: Int
-}
-
-func totalScore(_ scores: [Score]) -> Int {
-    scores.reduce(0) { $0 + $1.value }
-}
-```
-
-Do not make this rewrite unless the representation still matches the domain and the cost matters.
-
-## Value types with reference-backed storage
+## Value types, COW, and hidden ownership
 
 A value type can carry ARC cost through its fields.
 
-Example:
-
-```swift
-struct RenderCommand {
-    var title: String
-    var payload: Data
-    var metadata: [String: String]
-}
-```
-
-Copying `RenderCommand` copies value containers, but `String`, `Data`, and `Dictionary` may share reference-backed storage. Passing many such values across layers may involve retain/release traffic even without explicit classes.
+A value such as `RenderCommand(title: String, payload: Data, metadata: [String: String])` copies value containers, but the fields may share reference-backed storage. Passing many such values across layers can involve retain/release traffic even without explicit classes.
 
 Review questions:
 
-* Does the struct contain COW storage?
-* Is it copied frequently?
-* Is mutation performed after copying?
-* Are large buffers retained longer than needed?
-* Would borrowing, scoping, or streaming reduce ownership pressure?
+- Which fields are reference-backed?
+- Is the value copied frequently?
+- Is mutation performed after copying?
+- Are large buffers retained longer than needed?
+- Would scoping, borrowing, streaming, or in-place mutation reduce ownership pressure?
+- Should deeper COW behavior be reviewed in `cow-and-large-values.md`?
 
-## Copy-on-write and ARC
-
-Copy-on-write storage uses reference-backed buffers. Copies are often cheap while storage is shared, but mutation may require uniqueness checks and buffer copying.
-
-Example:
-
-```swift
-func normalizedTags(_ tags: [String]) -> [String] {
-    var result = tags
-    for index in result.indices {
-        result[index] = result[index].lowercased()
-    }
-    return result
-}
-```
-
-This may allocate new strings and may trigger array buffer behavior depending on uniqueness and capacity.
-
-Review rule:
-
-* Do not assume COW means free copying.
-* Do not assume COW means expensive copying.
-* Inspect whether copies are followed by mutation and whether the path is hot.
+Copy-on-write is neither free nor automatically expensive. It is usually cheap while storage is shared, but mutation may require uniqueness checks, new buffers, or element-level work.
 
 ## Objective-C bridging and autorelease behavior
 
 Swift code that crosses Objective-C or Foundation boundaries may introduce ownership behavior that is not obvious from pure Swift source.
 
-Watch for:
+Watch for repeated bridging between Swift and Objective-C collection/string types, Foundation APIs returning autoreleased objects, Objective-C callbacks that retain blocks, Core Foundation create/copy/get ownership conventions, and `Unmanaged` usage.
 
-* repeated bridging between `String` and `NSString`
-* repeated bridging between `Array` and `NSArray`
-* repeated bridging between `Dictionary` and `NSDictionary`
-* Foundation APIs returning autoreleased objects
-* Objective-C callbacks that retain blocks
-* Core Foundation APIs with create/copy/get ownership conventions
-* `Unmanaged` usage
+A Foundation boundary can be fine. If called repeatedly in a Swift hot path, check whether bridging or Foundation dispatch contributes to the cost.
 
-Example:
-
-```swift
-func containsKeyword(_ keyword: String, in text: NSString) -> Bool {
-    text.range(of: keyword).location != NSNotFound
-}
-```
-
-This may be fine at a boundary. If called repeatedly in a Swift hot path, check whether bridging or Foundation dispatch is contributing to the cost.
-
-Review rule:
-
-* Keep bridging at boundaries when possible.
-* Avoid repeated back-and-forth conversion in inner loops.
-* Use `autoreleasepool {}` around large Objective-C-heavy loops when memory spikes are caused by autoreleased temporary objects.
-* Be careful with Core Foundation ownership rules.
+Prefer keeping bridging at API boundaries, avoiding back-and-forth conversion inside inner loops, using `autoreleasepool {}` only when autoreleased temporaries are the measured cause, and reviewing Core Foundation ownership rules explicitly.
 
 ## Observed object lifetime
 
 Do not rely on the exact moment when an object is destroyed unless the language or API explicitly guarantees the lifetime.
 
-The compiler may shorten or extend object lifetimes as long as program semantics are preserved. Optimization level and code shape can change when `deinit` runs.
+The compiler may shorten or extend lifetimes as long as program semantics are preserved. Optimization level and code shape can change when `deinit` runs.
 
-Avoid patterns where correctness depends on incidental deinitialization timing.
+Avoid correctness patterns that depend on incidental deinitialization timing.
 
-Risky pattern:
+If cleanup timing matters, prefer an explicit lifetime scope such as `withTemporaryFile`, explicit invalidation, `defer`, or a well-defined owner that performs cleanup at a known point.
 
-```swift
-final class TemporaryFile {
-    let url: URL
+Use `withExtendedLifetime` only when code must guarantee that a value remains alive through a specific operation and the lifetime is otherwise invisible to Swift, usually at unsafe or C/Objective-C interop boundaries.
 
-    init(url: URL) {
-        self.url = url
-    }
+## Evidence to check
 
-    deinit {
-        try? FileManager.default.removeItem(at: url)
-    }
-}
+Use evidence before recommending ownership rewrites.
 
-func uploadTemporaryFile(_ data: Data, uploader: Uploader) async throws {
-    let file = TemporaryFile(url: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
-    try data.write(to: file.url)
+In optimized SIL, ARC-related signs include:
 
-    try await uploader.upload(file.url)
-}
-```
+- `strong_retain` / `strong_release`;
+- `retain_value` / `release_value`;
+- `copy_value` / `destroy_value`;
+- `partial_apply`;
+- `alloc_ref` / `alloc_box`;
+- `load_weak` / `store_weak`;
+- `strong_copy_unowned_value`;
+- `ref_to_unowned` / `unowned_to_ref`.
 
-If resource cleanup timing is important, make it explicit.
+Use SIL as supporting evidence. Do not treat every visible retain/release as a bug. The question is whether ownership traffic remains in optimized output and matters in a measured path.
 
-Better:
+In Time Profiler, look for retain/release functions near the hot path, closure allocation or destruction around repeated operations, Objective-C retain/release activity, type-erased wrapper churn, and object-heavy loops with poor locality.
 
-```swift
-func withTemporaryFile<Result>(
-    data: Data,
-    operation: (URL) async throws -> Result
-) async throws -> Result {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    try data.write(to: url)
+In Allocations, look for repeated short-lived objects, closure context allocation, retained object graphs, unexpected Foundation objects, temporary buffers, and spikes during scrolling, parsing, rendering, search, or import.
 
-    do {
-        let result = try await operation(url)
-        try? FileManager.default.removeItem(at: url)
-        return result
-    } catch {
-        try? FileManager.default.removeItem(at: url)
-        throw error
-    }
-}
-```
-
-Use explicit lifetime scopes for resources such as files, locks, observations, subscriptions, and unsafe buffers.
-
-## `withExtendedLifetime`
-
-Use `withExtendedLifetime` when code must guarantee that a value remains alive through a specific operation and the compiler may otherwise be allowed to end its lifetime earlier.
-
-Typical cases:
-
-* unsafe pointer interop
-* C/Objective-C APIs with lifetime assumptions not visible to Swift
-* side effects that depend on an object staying alive
-* low-level code where lifetime is part of the API contract
-
-Example:
-
-```swift
-final class BufferOwner {
-    let bytes: UnsafeMutableRawPointer
-    let count: Int
-
-    init(count: Int) {
-        self.count = count
-        self.bytes = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 1)
-    }
-
-    deinit {
-        bytes.deallocate()
-    }
-}
-
-func callLegacyAPI(owner: BufferOwner) {
-    legacy_consume(owner.bytes, owner.count)
-
-    withExtendedLifetime(owner) {
-        // Ensures owner is kept alive through the legacy call boundary.
-    }
-}
-```
-
-Prefer structuring code so lifetime is clear without this function. Use `withExtendedLifetime` as an explicit bridge when lifetime is otherwise invisible to Swift.
-
-## SIL signs of ARC traffic
-
-In optimized SIL, look for:
-
-* `strong_retain`
-* `strong_release`
-* `retain_value`
-* `release_value`
-* `copy_value`
-* `destroy_value`
-* `partial_apply`
-* `alloc_ref`
-* `alloc_box`
-* `load_weak`
-* `store_weak`
-* `strong_copy_unowned_value`
-* `ref_to_unowned`
-* `unowned_to_ref`
-
-Use SIL as supporting evidence. Do not assume every visible retain/release is a problem. The important question is whether ARC traffic remains in a measured hot path after optimization.
-
-## Instruments signs
-
-In Time Profiler, look for:
-
-* retain/release functions near the hot path
-* closure allocation or destruction around repeated operations
-* Objective-C retain/release or autorelease pool activity
-* type-erased wrapper churn
-* object-heavy loops with poor locality
-
-In Allocations, look for:
-
-* repeated short-lived objects
-* closure context allocation
-* retained object graphs growing over time
-* unexpected Foundation objects
-* temporary arrays, dictionaries, strings, or data buffers
-* spikes during scrolling, parsing, rendering, or search
-
-In Leaks / Memory Graph, look for:
-
-* object cycles through closures
-* delegate cycles
-* long-lived tasks retaining owners
-* subscription/token cycles
-* caches without eviction
-* observers not removed or invalidated
-
-## Common review recommendations
-
-Prefer:
-
-* explicit ownership relationships
-* strong references for required dependencies
-* weak references for optional back references
-* unowned references only for proven lifetime invariants
-* narrow closure captures
-* explicit resource cleanup
-* scoped temporary values
-* value representations in hot data paths when they match the domain
-* avoiding repeated bridging in inner loops
-* measuring optimized builds before changing ownership design
-
-Avoid:
-
-* using `weak` everywhere
-* using `unowned` to avoid optionals
-* using `[weak self]` reflexively
-* relying on `deinit` timing for important side effects
-* replacing all classes with structs
-* rewriting clear ownership for theoretical ARC savings
-* ignoring COW storage inside value types
-* ignoring Objective-C bridging at Foundation-heavy boundaries
-* treating every retain/release in SIL as a bug
+In Memory Graph or Leaks, look for closure cycles, delegate cycles, long-lived tasks retaining owners, subscription/token cycles, caches without eviction, and observers not removed or invalidated.
 
 ## Decision rules
 
 ### If you see `[weak self]`
 
-Ask:
-
-* Is the closure escaping?
-* Is the closure stored by `self` or by something retained by `self`?
-* Can the closure outlive `self`?
-* Is silently skipping the work correct if `self` is gone?
-* Would capturing a specific dependency be better?
+Ask whether the closure is escaping, whether it is stored by `self` or by something retained by `self`, whether it can outlive `self`, whether silently skipping work is correct, and whether capturing a specific dependency would better express the lifetime.
 
 Use `[weak self]` when it prevents an unwanted lifetime extension or reference cycle. Do not use it as a universal closure style.
 
 ### If you see `[unowned self]`
 
-Ask:
-
-* Can the closure ever outlive `self`?
-* Is the lifetime invariant obvious and documented?
-* Would a crash be acceptable if the invariant is violated?
-* Is `weak` more honest about the relationship?
+Ask whether the closure can outlive `self`, whether the lifetime invariant is obvious and documented, whether a crash is acceptable if the invariant is violated, and whether `weak` is more honest about the relationship.
 
 Use `[unowned self]` only when the lifetime guarantee is strong.
 
 ### If you see a stored closure
 
-Ask:
+Ask who owns the closure, what it captures, whether it can capture its owner, whether there is an explicit invalidation path, and whether it needs the whole owner or only a dependency.
 
-* Who owns the closure?
-* What does the closure capture?
-* Can the closure capture its owner?
-* Is there an explicit invalidation path?
-* Does the closure need the whole owner or only a dependency?
+### If you see a task stored by an object
 
-### If you see a reference-heavy value type
-
-Ask:
-
-* Which fields are reference-backed?
-* Is the value copied often?
-* Is it mutated after copying?
-* Is the value crossing async or actor boundaries?
-* Is it retained by closures or tasks?
+Ask whether the task closure captures the same object strongly, whether the task can run longer than the owner’s intended lifetime, whether cancellation is explicit, whether capturing a service/value is enough, and whether the broader issue belongs in `swift-concurrency-performance`.
 
 ### If you see a memory leak
 
-Ask:
+Ask whether there is a strong cycle, a task/subscription/timer/display link/observer/callback keeping the object alive, a cache without eviction, a stored closure capturing `self`, or cleanup tied to unreliable `deinit` timing.
 
-* Is there a strong cycle?
-* Is a task/subscription/observer keeping the object alive?
-* Is a cache retaining objects without eviction?
-* Is a closure capturing `self` strongly?
-* Is cleanup tied to unreliable `deinit` timing?
+## Common refactor patterns
+
+Prefer these when they match the ownership model:
+
+- Capture a dependency instead of `self`.
+- Make back references `weak` when `nil` is valid.
+- Use `unowned` only for local, provable lifetime invariants.
+- Add explicit invalidation for timers, observers, display links, subscriptions, and callbacks.
+- Clear stored closures when the owner no longer needs them.
+- Keep bridging at boundaries instead of repeatedly converting in loops.
+- Use explicit lifetime scopes for resources.
+- Replace reference-heavy representations in hot data paths only when the value model still fits.
+- Reduce repeated closure allocation in hot paths.
+- Inspect optimized SIL when source-level reasoning is ambiguous.
+
+Avoid using `weak` everywhere, using `unowned` to avoid optionals, using `[weak self]` reflexively, relying on `deinit` timing for important side effects, replacing all classes with structs, rewriting clear ownership for theoretical ARC savings, ignoring COW storage inside value types, ignoring Objective-C bridging in Foundation-heavy paths, or treating every retain/release in SIL as a bug.
+
+## Validation
+
+For leaks or retained object graphs:
+
+- Use Xcode Memory Graph or Leaks.
+- Add a targeted lifecycle test with weak references.
+- Verify observers, subscriptions, timers, and tasks are invalidated.
+
+For ARC traffic or closure churn:
+
+- Measure an optimized build.
+- Use Time Profiler around the suspected hot path.
+- Use Allocations to check short-lived objects and closure contexts.
+- Inspect optimized SIL if profiling points to abstraction overhead.
+
+For bridging/autorelease pressure:
+
+- Use Allocations to identify Foundation temporaries.
+- Use `autoreleasepool {}` only when autoreleased temporaries are the measured cause.
+- Move conversion outside inner loops and remeasure.
+
+For COW ownership pressure:
+
+- Check whether copies are followed by mutation.
+- Check buffer growth and temporary allocation behavior.
+- Compare before/after with representative data sizes.
+
+Do not call an ownership change successful without a before/after signal.
 
 ## Output guidance
 
@@ -697,15 +314,19 @@ Identify retain cycle, lifetime extension, ARC traffic, weak/unowned misuse, COW
 
 ## Why it matters
 
-Tie the issue to correctness, memory growth, CPU overhead, or user-visible performance.
+Tie the issue to correctness, memory growth, CPU overhead, memory pressure, or user-visible performance.
 
 ## Recommended change
 
 Suggest the smallest ownership change that preserves semantics.
+
+## Trade-offs
+
+Explain whether the change affects optionality, lifetime guarantees, readability, safety, or API design.
 
 ## Validation
 
 Recommend Memory Graph, Leaks, Allocations, Time Profiler, optimized SIL, or a targeted lifetime test.
 ```
 
-If ARC traffic is only theoretical and there is no hot path or memory issue, say so directly.
+If ARC traffic is only theoretical and there is no hot path, memory issue, or lifetime bug, say so directly and avoid low-level rewrites.
