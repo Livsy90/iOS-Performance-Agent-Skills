@@ -1,49 +1,72 @@
 # Actor Reentrancy
 
-Use this reference when reviewing actor methods that contain `await`, coordinate cached work, mutate state around suspension points, or show duplicate async work under load.
+Use this reference when the task involves actor-isolated state, duplicate network requests, cache stampedes, state checks before and after `await`, or actor queue buildup.
 
-## Core Rule
+This reference is about performance and correctness risks caused by actor reentrancy. It is not a general actor tutorial.
+
+## Contents
+
+- [Core model](#core-model)
+- [When this matters](#when-this-matters)
+- [Review workflow](#review-workflow)
+- [Cache miss duplicate work](#cache-miss-duplicate-work)
+- [In-flight task pattern](#in-flight-task-pattern)
+- [State checks across await](#state-checks-across-await)
+- [Actor contention and queue buildup](#actor-contention-and-queue-buildup)
+- [Decision rules](#decision-rules)
+- [Common mistakes](#common-mistakes)
+- [Validation](#validation)
+- [Review checklist](#review-checklist)
+
+## Core model
 
 Actor isolation prevents data races on actor-isolated state. It does not make an entire `async` actor method atomic.
 
-Every `await` inside an actor-isolated method is a reentrancy boundary. While the method is suspended, the actor may process other work. When the original method resumes, actor state may no longer match the assumptions made before suspension.
+Every `await` inside an actor-isolated method is a reentrancy boundary. While the method is suspended, the actor may run other work. When the original method resumes, actor state may no longer match the assumptions made before suspension.
 
-Review actor methods as sequences of synchronous isolated regions separated by suspension points.
+Review actor methods as isolated synchronous regions separated by suspension points:
 
-## What to Look For
+```text
+read actor state
+await external work     <- reentrancy boundary
+resume later
+use actor state again
+```
 
-Flag actor methods where code:
+The key question: what assumptions were made before `await`, and are they still valid after the method resumes?
 
-* reads actor state
-* reaches an `await`
-* later assumes the previously read state is still valid
+## When this matters
 
-Common symptoms:
+Look for actor reentrancy when code:
 
-* duplicate network requests
-* duplicate decoding or parsing
-* stale validation
-* quota or budget going negative
-* state machine transitions happening out of order
-* cache writes overwriting newer state
-* inconsistent metrics or counters
+- reads actor state before an `await`;
+- assumes that state is still valid after the `await`;
+- performs cache lookups around async loads;
+- coordinates shared network requests;
+- mutates counters, quotas, budgets, or state machines;
+- shows duplicate requests, cache stampedes, stale validation, negative counters, out-of-order transitions, or actor queue buildup.
 
-## Cache Miss Duplicate Work
+## Review workflow
+
+1. 1Find actor methods that contain `await`.
+2. 2Mark state reads before each `await`.
+3. 3Mark state mutations after each `await`.
+4. 4Ask what other actor calls could run during suspension.
+5. 5Check whether two callers can start the same expensive work.
+6. 6Check whether validation before suspension must be repeated after suspension.
+7. 7Check whether state can be committed before suspension.
+8. 8Check whether hot actor calls can be batched.
+9. 9Recommend the smallest change that preserves the actor's consistency model.
+10. 10Include a validation path.
+
+## Cache miss duplicate work
 
 Risky:
 
 ```swift
-protocol ResourceLoading: Sendable {
-    func loadResource(for key: ResourceKey) async throws -> Resource
-}
-
 actor ResourceCatalog {
     private var cache: [ResourceKey: Resource] = [:]
     private let loader: any ResourceLoading
-
-    init(loader: any ResourceLoading) {
-        self.loader = loader
-    }
 
     func resource(for key: ResourceKey) async throws -> Resource {
         if let cached = cache[key] {
@@ -57,35 +80,17 @@ actor ResourceCatalog {
 }
 ```
 
-This has no data race, but it has a reentrancy window.
+This has no data race, but it has a reentrancy window. Task A can see a cache miss and suspend while loading. Task B can then enter the actor, see the same miss, and start a second load. Actor isolation protected the dictionary. It did not deduplicate the async operation.
 
-If two tasks request the same missing key:
-
-1. Task A enters the actor and sees a cache miss.
-2. Task A suspends while loading.
-3. Task B enters the actor and sees the same cache miss.
-4. Task B starts a second load.
-5. Both tasks eventually store a value.
-
-Actor isolation protected the dictionary, but it did not deduplicate the async operation.
-
-## In-Flight Task Pattern
+## In-flight task pattern
 
 Use an in-flight table when the actor must deduplicate work across suspension points.
 
 ```swift
-protocol ResourceLoading: Sendable {
-    func loadResource(for key: ResourceKey) async throws -> Resource
-}
-
 actor ResourceCatalog {
     private var cache: [ResourceKey: Resource] = [:]
     private var inFlight: [ResourceKey: Task<Resource, Error>] = [:]
     private let loader: any ResourceLoading
-
-    init(loader: any ResourceLoading) {
-        self.loader = loader
-    }
 
     func resource(for key: ResourceKey) async throws -> Resource {
         if let cached = cache[key] {
@@ -116,34 +121,28 @@ actor ResourceCatalog {
 }
 ```
 
-This still suspends, but the important coordination state is written before suspension. Later callers find `inFlight[key]` and await the same task instead of starting duplicate work.
+The important coordination state is written before suspension. Later callers find `inFlight[key]` and await the same task instead of starting duplicate work.
 
-## Cleanup and Cancellation Notes
+Use this pattern when duplicate work is expensive, many callers may request the same missing value, the result can be shared safely, and the actor owns the shared operation.
 
-When reviewing an in-flight task pattern, check:
+For shared in-flight work, always define cancellation policy:
 
-* Is the in-flight entry removed on success?
-* Is it removed on failure?
-* What happens if all waiters are cancelled?
-* Should cancellation of one waiter cancel the shared operation?
-* Is the shared task intentionally allowed to complete for future callers?
-* Is the task priority appropriate for the work?
+- what happens if one waiter is cancelled;
+- what happens if all waiters are cancelled;
+- whether the shared task should complete for future callers;
+- whether the in-flight entry is removed on both success and failure;
+- whether the task priority is appropriate for shared work.
 
-For shared cache loads, cancelling the underlying operation when one caller cancels is often wrong, because other callers may still need the result. For owner-scoped work, cancellation may need to cancel the underlying task.
+For cache loads, cancelling the underlying operation when one caller cancels is often wrong because other callers may still need the result. For owner-scoped work, cancellation may need to cancel the underlying task.
 
-Do not assume one cancellation policy fits every actor.
-
-## State Validation Across Await
+## State checks across await
 
 Risky:
 
 ```swift
 actor DownloadQuota {
     private var remainingMegabytes: Int
-
-    init(remainingMegabytes: Int) {
-        self.remainingMegabytes = remainingMegabytes
-    }
+    private let audit: AuditLogging
 
     func approveDownload(size: Int) async throws {
         guard remainingMegabytes >= size else {
@@ -157,86 +156,42 @@ actor DownloadQuota {
 }
 ```
 
-The validation happens before suspension. Another task may consume quota while `audit.logApproval` is running.
+The validation happens before suspension. Another caller may consume quota while `audit.logApproval` is running.
 
 Prefer committing state before suspension when the business rule allows it:
 
 ```swift
-actor DownloadQuota {
-    private var remainingMegabytes: Int
-
-    init(remainingMegabytes: Int) {
-        self.remainingMegabytes = remainingMegabytes
+func approveDownload(size: Int) async throws {
+    guard remainingMegabytes >= size else {
+        throw QuotaError.notEnoughCapacity
     }
 
-    func approveDownload(size: Int) async throws {
-        guard remainingMegabytes >= size else {
-            throw QuotaError.notEnoughCapacity
-        }
-
-        remainingMegabytes -= size
-        await audit.logApproval(size)
-    }
+    remainingMegabytes -= size
+    await audit.logApproval(size)
 }
 ```
 
-If the external operation must happen before the state mutation, re-check after suspension:
+If external work must happen before the state mutation, re-check after suspension:
 
 ```swift
-actor DownloadQuota {
-    private var remainingMegabytes: Int
-
-    init(remainingMegabytes: Int) {
-        self.remainingMegabytes = remainingMegabytes
+func approveAfterVerification(size: Int) async throws {
+    guard remainingMegabytes >= size else {
+        throw QuotaError.notEnoughCapacity
     }
 
-    func approveAfterVerification(size: Int) async throws {
-        guard remainingMegabytes >= size else {
-            throw QuotaError.notEnoughCapacity
-        }
+    try await verifier.verifyDownload(size)
 
-        try await verifier.verifyDownload(size)
-
-        guard remainingMegabytes >= size else {
-            throw QuotaError.notEnoughCapacity
-        }
-
-        remainingMegabytes -= size
+    guard remainingMegabytes >= size else {
+        throw QuotaError.notEnoughCapacity
     }
+
+    remainingMegabytes -= size
 }
 ```
 
-## Transaction-Like Actor Methods
+The second check is not redundant. It protects the business invariant after the reentrancy boundary.
 
-If the code needs transaction-like behavior, avoid placing suspension points inside the critical state transition.
-
-Prefer this shape:
-
-```swift
-actor SyncStateMachine {
-    private var state: SyncState = .idle
-
-    func beginSync() throws -> SyncToken {
-        guard state == .idle else {
-            throw SyncError.alreadyRunning
-        }
-
-        let token = SyncToken()
-        state = .running(token)
-        return token
-    }
-
-    func finishSync(token: SyncToken, result: Result<Void, Error>) {
-        guard state == .running(token) else {
-            return
-        }
-
-        state = .finished(result)
-    }
-}
-```
-
-Then perform the async work outside the actor transaction:
+For transaction-like workflows, split the operation into short actor-isolated state transitions and long external work:
 
 ```swift
 let token = try await stateMachine.beginSync()
@@ -249,20 +204,13 @@ do {
 }
 ```
 
-This makes the actor responsible for state transitions, not for the whole async operation.
+`beginSync()` and `finishSync()` should be short isolated transitions. The long async operation should run outside the actor transaction.
 
-## Actor Contention
+## Actor contention and queue buildup
 
-Reentrancy prevents one suspended method from blocking the actor forever, but actors can still become bottlenecks.
+Reentrancy prevents a suspended actor method from blocking the actor forever, but actors can still become bottlenecks.
 
-Look for:
-
-* many tasks awaiting the same actor
-* hot actor methods called once per item
-* expensive synchronous work inside actor methods
-* repeated actor hops in tight loops
-* actor used as a logging or metrics funnel
-* actor protecting unrelated pieces of state
+Look for many tasks awaiting the same actor, hot actor methods called once per item, expensive synchronous work inside actor methods, repeated actor hops in tight loops, logging/metrics funnels, and CPU-heavy work that does not need actor isolation.
 
 Risky:
 
@@ -278,45 +226,71 @@ Prefer batching:
 await analyticsStore.append(contentsOf: events)
 ```
 
-Risky:
+If a method does not read or mutate actor-isolated state, keep it outside actor isolation:
 
 ```swift
 actor DocumentStore {
-    private var documents: [DocumentID: Document] = [:]
-
-    func tokenize(_ document: Document) -> [Token] {
-        Tokenizer.tokenize(document.text)
-    }
-}
-```
-
-If `tokenize` does not need actor state, it should not be actor-isolated:
-
-```swift
-actor DocumentStore {
-    private var documents: [DocumentID: Document] = [:]
-
     nonisolated func tokenize(_ document: Document) -> [Token] {
         Tokenizer.tokenize(document.text)
     }
 }
 ```
 
-Use `nonisolated` only when the method does not read or mutate actor-isolated state.
+Use `nonisolated` only when the method does not touch actor-isolated state.
 
-## Review Checklist
+Do not split state across many actors just to increase parallelism. Split actors only when the split matches the consistency model.
+
+## Decision rules
+
+- Treat every `await` inside an actor method as a possible state invalidation point.
+- Write coordination state before suspension when deduplicating work.
+- Commit state before `await` when the business rule allows it.
+- Re-check state after `await` when external work must happen first.
+- Keep transaction-like state transitions short and synchronous when possible.
+- Use an in-flight table when duplicate work is expensive and shareable.
+- Make cancellation policy explicit for shared in-flight work.
+- Batch actor calls on hot paths.
+- Move CPU-heavy work out of actor isolation when it does not need actor state.
+- Do not use actor isolation as a substitute for workflow design.
+
+## Common mistakes
+
+- Assuming an actor method is atomic from entry to return.
+- Reading state, awaiting, then mutating based on the stale read.
+- Using a cache dictionary without tracking in-flight loads.
+- Cancelling a shared in-flight task when only one waiter cancels.
+- Forgetting to remove in-flight entries on failure.
+- Putting expensive CPU work inside an actor because the actor owns related data.
+- Calling an actor once per item in a tight loop.
+- Splitting one consistency domain across multiple actors without a clear invariant.
+- Adding locks inside actors before understanding the reentrancy problem.
+- Treating actor queue buildup as a reason to remove isolation rather than narrowing isolated work.
+
+## Validation
+
+For duplicate work, add request identifiers in logs, count requests per cache key, stress test many concurrent callers requesting the same key, and verify only one underlying load starts for a cache miss.
+
+For stale state after `await`, write tests with concurrent callers, add controlled suspension points using test doubles, and verify counters, quotas, and state transitions cannot go negative or out of order.
+
+For actor contention, use Instruments to inspect actor timelines and task waiting, compare per-item actor calls with batched calls, and use signposts around actor APIs on hot paths.
+
+Do not call the fix successful only because the data race is gone. Actor reentrancy problems are usually correctness, duplication, latency, or throughput problems.
+
+## Review checklist
 
 Use this checklist for actor methods:
 
-* [ ] Does the method contain `await`?
-* [ ] Is actor state read before `await` and trusted after `await`?
-* [ ] Can another caller enter during suspension and change the state?
-* [ ] Could two callers start the same expensive work?
-* [ ] Should in-flight work be tracked?
-* [ ] Is cleanup handled on success and failure?
-* [ ] Is cancellation policy explicit?
-* [ ] Can state be committed before suspension?
-* [ ] If not, is state re-validated after suspension?
-* [ ] Is the actor doing expensive work that does not need isolation?
-* [ ] Are hot actor calls batched?
-* [ ] Would a smaller isolated section or a synchronous primitive fit better?
+- [ ] Does the method contain `await`?
+- [ ] Is actor state read before `await` and trusted after `await`?
+- [ ] Can another caller enter during suspension and change the state?
+- [ ] Could two callers start the same expensive work?
+- [ ] Should in-flight work be tracked?
+- [ ] Is in-flight cleanup handled on success and failure?
+- [ ] Is the cancellation policy explicit?
+- [ ] Can state be committed before suspension?
+- [ ] If not, is state re-validated after suspension?
+- [ ] Is the actor doing expensive work that does not need isolation?
+- [ ] Are hot actor calls batched?
+- [ ] Is the actor protecting one clear consistency domain?
+- [ ] Would a smaller isolated section fit better?
+- [ ] Is the proposed fix validated with a stress test, logs, signposts, or Instruments?
