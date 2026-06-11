@@ -2,41 +2,57 @@
 
 Use this reference when reviewing SwiftUI code that involves structural identity, explicit `.id(...)`, `ForEach` identity, local state lifetime, `@State`, `@StateObject`, `@ObservedObject`, or owned observable models.
 
-This reference is about identity and state lifetime. Keep Observation dependency granularity, broad model reads, list pagination strategy, closure-heavy rows, custom bindings, and profiling details in their dedicated references.
+This reference is about identity and state lifetime. Keep Observation dependency granularity, broad model reads, list pagination, closure-heavy rows, custom bindings, body cost, and profiling details in their dedicated references.
 
-## Agent Goal
+## Contents
+
+- [Agent goal](#agent-goal)
+- [Core mental model](#core-mental-model)
+- [Structural identity](#structural-identity)
+- [Explicit identity with `.id(...)`](#explicit-identity-with-id)
+- [`ForEach` identity](#foreach-identity)
+- [Local `@State` lifetime](#local-state-lifetime)
+- [State ownership boundaries](#state-ownership-boundaries)
+- [`@StateObject` and `@ObservedObject`](#stateobject-and-observedobject)
+- [Owned `@Observable` models](#owned-observable-models)
+- [State reset diagnostics](#state-reset-diagnostics)
+- [Review language](#review-language)
+- [Common mistakes](#common-mistakes)
+- [Minimal checklist](#minimal-checklist)
+
+## Agent goal
 
 Help the user understand whether SwiftUI can preserve the right view identity and state across updates.
 
-When reviewing code, answer these questions:
+When reviewing code, answer:
 
 - Does this view keep the same identity across normal updates?
 - Is local state attached to a stable identity?
 - Are collection rows identified by stable data identity rather than position or temporary values?
-- Is the model owned by the view, injected into the view, or owned elsewhere?
-- Would a structural branch, explicit `.id(...)`, or unstable `ForEach` ID accidentally reset state?
+- Is the model owned by this view, injected into this view, or owned elsewhere?
+- Would a branch, explicit `.id(...)`, or unstable `ForEach` ID accidentally reset state?
 
-Avoid vague claims such as "SwiftUI redraws everything." Prefer precise language about identity, lifetime, and dependency boundaries.
+Avoid vague claims such as "SwiftUI redraws everything." Prefer precise language about identity, lifetime, and ownership boundaries.
 
-## 1. Core Mental Model
+## Core mental model
 
 SwiftUI view values are temporary descriptions. State is not stored inside the view value itself. SwiftUI preserves state by associating it with identity in the view hierarchy.
 
 A view's identity usually comes from:
 
-- its structural position in the view tree
-- the concrete view type at that position
-- explicit identity provided by APIs such as `ForEach` or `.id(...)`
+- its structural position in the view tree;
+- the concrete view type at that position;
+- explicit identity provided by APIs such as `ForEach` or `.id(...)`.
 
 When identity changes, SwiftUI may treat the view as a different view. State attached to the previous identity can be discarded and new state can be created.
 
-Review identity issues before suggesting lower-level optimization. Many SwiftUI performance and correctness bugs come from state being attached to the wrong lifetime boundary.
+Review identity issues before suggesting lower-level optimization. Many SwiftUI correctness and performance bugs come from state being attached to the wrong lifetime boundary.
 
-## 2. Structural Identity
+## Structural identity
 
-SwiftUI normally derives identity from structure. Two branches that look visually similar can still represent different structural identities if they produce different view types or different positions in the hierarchy.
+SwiftUI normally derives identity from structure. Two branches that look visually similar can still represent different identities if they produce different view types or different positions in the hierarchy.
 
-Risky when the same conceptual view appears in different branches:
+Risky when the same conceptual view appears in separate branches:
 
 ```swift
 struct PaymentStatusView: View {
@@ -45,10 +61,8 @@ struct PaymentStatusView: View {
     var body: some View {
         if isPending {
             StatusCard(title: "Processing")
-                .transition(.opacity)
         } else {
             StatusCard(title: "Complete")
-                .transition(.opacity)
         }
     }
 }
@@ -62,23 +76,22 @@ struct PaymentStatusView: View {
 
     var body: some View {
         StatusCard(title: isPending ? "Processing" : "Complete")
-            .transition(.opacity)
     }
 }
 ```
 
 Do not mechanically remove all branches. Branches are normal SwiftUI. Flag them only when they accidentally reset state, create unstable layout, or make a hot repeated view structurally unpredictable.
 
-## 3. Explicit `.id(...)`
+## Explicit identity with `.id(...)`
 
 Use `.id(...)` only when creating a deliberate identity boundary.
 
 Good reasons:
 
-- reset local state intentionally
-- make a detail/editor view start fresh for a different entity
-- define a scroll target
-- force a known lifecycle boundary after a meaningful identity change
+- reset local state intentionally;
+- make a detail or editor view start fresh for a different entity;
+- define a scroll target;
+- force a known lifecycle boundary after a meaningful identity change.
 
 Risky:
 
@@ -96,15 +109,15 @@ InvoiceEditor(invoice: invoice)
     .id(invoice.id)
 ```
 
-Only use this if changing `invoice.id` should discard editor-local state such as draft fields, focus, validation state, or temporary selections.
+Only use this if changing `invoice.id` should discard editor-local state such as draft fields, focus, validation state, temporary selections, or lifecycle-bound work.
 
-Avoid using `.id(...)` as a generic refresh workaround. First check whether the real issue is stale derived state, wrong ownership, missing dependency updates, or an async lifecycle bug.
+Avoid using `.id(...)` as a generic refresh workaround. First check whether the real issue is stale derived state, wrong ownership, missing dependency updates, or async lifecycle behavior.
 
-## 4. `ForEach` Identity
+## `ForEach` identity
 
 Dynamic collections need stable, unique, cheap identifiers. Row identity should come from the underlying data, not from the current array position or a temporary value.
 
-Risky for mutable or reorderable collections:
+Risky for mutable, filterable, reorderable, or pageable collections:
 
 ```swift
 ForEach(Array(messages.enumerated()), id: \.offset) { _, message in
@@ -150,30 +163,18 @@ struct MessageRowModel: Identifiable {
 
 Use `id: \.self` only when the value is truly unique and stable for the lifetime of the collection. It is usually fine for a fixed list of unique strings or enum values. It is risky for duplicate values, mutable values, or values whose equality changes when visible content changes.
 
-## 5. Local State Lifetime
+## Local `@State` lifetime
 
-Use `@State` for local value state owned by a view identity.
+Use `@State` for local value state owned by a stable view identity.
 
 Good candidates:
 
-- expansion state inside a component
-- local draft text
-- focus-related UI flags
-- temporary selection inside a picker-like component
-- small animation state
-- presentation toggles owned by the current view
-
-Example:
-
-```swift
-struct TransferNoteField: View {
-    @State private var note = ""
-
-    var body: some View {
-        TextField("Note", text: $note)
-    }
-}
-```
+- expansion state inside a component;
+- local draft text;
+- focus-related UI flags;
+- temporary selection inside a picker-like component;
+- small animation state;
+- presentation toggles owned by the current view.
 
 Keep `@State` private whenever possible. External code should not depend on a child view's private state storage.
 
@@ -209,15 +210,13 @@ struct UserNameView: View {
 }
 ```
 
-If local editing is needed, make the ownership explicit:
+If local editing is needed, make the snapshot intentional:
 
 ```swift
 struct EditableUserNameView: View {
-    let initialName: String
     @State private var draftName: String
 
     init(initialName: String) {
-        self.initialName = initialName
         _draftName = State(initialValue: initialName)
     }
 
@@ -227,33 +226,13 @@ struct EditableUserNameView: View {
 }
 ```
 
-In this case, the snapshot is intentional because `draftName` is local draft state.
+In this case, `draftName` is a local draft. It should not automatically track every later parent value unless the product behavior requires that.
 
-## 6. Put State at the Smallest Stable Owner
+## State ownership boundaries
 
-State should live at the smallest stable boundary that owns it.
+State should live at the smallest stable boundary that owns the behavior.
 
-Risky: a parent owns unrelated local flags for many child regions.
-
-```swift
-struct WalletScreen: View {
-    @State private var isSearchFocused = false
-    @State private var isCardExpanded = false
-    @State private var selectedFilter = Filter.all
-    @State private var draftNickname = ""
-
-    var body: some View {
-        WalletContent(
-            isSearchFocused: $isSearchFocused,
-            isCardExpanded: $isCardExpanded,
-            selectedFilter: $selectedFilter,
-            draftNickname: $draftNickname
-        )
-    }
-}
-```
-
-Prefer local ownership when the state belongs to a specific component:
+Prefer local ownership when state belongs to one component:
 
 ```swift
 struct WalletScreen: View {
@@ -270,11 +249,11 @@ struct WalletScreen: View {
 }
 ```
 
-This does not guarantee fewer updates by itself, but it makes lifetime and dependency boundaries easier to reason about.
+This does not guarantee fewer updates by itself. It makes lifetime, ownership, and dependency boundaries easier to reason about.
 
-Lift state up when multiple components need the same source of truth or when the parent coordinates the behavior. Do not push state down so far that synchronization becomes unclear.
+Lift state up when multiple components need the same source of truth or when the parent coordinates behavior. Do not push state down so far that synchronization becomes unclear.
 
-## 7. `@StateObject` vs `@ObservedObject`
+## `@StateObject` and `@ObservedObject`
 
 Use `@StateObject` when a SwiftUI view creates and owns an `ObservableObject`.
 
@@ -309,30 +288,14 @@ Use `@ObservedObject` when the object is owned elsewhere and injected:
 ```swift
 struct RatesContent: View {
     @ObservedObject var model: RatesModel
-
-    var body: some View {
-        List(model.rows) { row in
-            RateRow(row: row)
-        }
-    }
 }
 ```
 
-Do not create an owned model as a plain stored property in a view:
+Do not create an owned model as a plain stored property in a view. SwiftUI view values can be recreated, and a plain stored reference does not express SwiftUI-managed lifetime.
 
-```swift
-struct RatesView: View {
-    private let model = RatesModel()
+Do not claim `@StateObject` is faster than `@ObservedObject`. The main distinction is ownership and lifetime.
 
-    var body: some View {
-        RatesContent(model: model)
-    }
-}
-```
-
-SwiftUI view values can be recreated. A plain stored reference does not express SwiftUI-managed lifetime.
-
-## 8. Owned Observable Models with Observation
+## Owned `@Observable` models
 
 For iOS 17 and later, an `@Observable` model owned by a view can be stored with `@State`.
 
@@ -359,28 +322,22 @@ If a parent owns the model, inject it into the child instead of creating it agai
 ```swift
 struct RatesContent: View {
     let model: RatesModel
-
-    var body: some View {
-        List(model.rows) { row in
-            RateRow(row: row)
-        }
-    }
 }
 ```
 
 This reference covers ownership and lifetime. Detailed Observation dependency behavior belongs in `observation-and-dependencies.md`.
 
-## 9. State Reset Diagnostics
+## State reset diagnostics
 
 Suspect accidental identity changes when the user reports:
 
-- text fields lose input unexpectedly
-- focus disappears during updates
-- scroll position resets without intent
-- rows lose expansion or selection state after filtering
-- async `.task` work restarts repeatedly
-- animations restart during unrelated updates
-- row-local state appears attached to the wrong item after insertion or deletion
+- text fields lose input unexpectedly;
+- focus disappears during updates;
+- scroll position resets without intent;
+- rows lose expansion or selection state after filtering;
+- async `.task` work restarts repeatedly;
+- animations restart during unrelated updates;
+- row-local state appears attached to the wrong item after insertion or deletion.
 
 Check:
 
@@ -392,7 +349,7 @@ Check:
 - Is an owned model created with `@ObservedObject` or a plain stored property?
 - Is state owned too high or too low in the tree?
 
-## 10. Safer Review Language
+## Review language
 
 Use precise wording:
 
@@ -412,18 +369,18 @@ This view creates its own observable model, so `@StateObject` is the correct own
 This `@State` value is initialized from a parent input, so it behaves like an initial snapshot. If the view should always show the latest parent value, derive it directly from the input instead.
 ```
 
-## 11. Do Not Overcorrect
-
-Avoid these overcorrections:
+## Common mistakes
 
 - Do not add `.id(...)` everywhere. Explicit identity is a tool, not a default requirement.
 - Do not replace every branch with value-based modifiers. Structural branching is fine when it expresses genuinely different UI.
 - Do not move all state to the parent. Local state is often better for local UI behavior.
 - Do not move all state to children. Shared source of truth still belongs at the coordinating owner.
-- Do not claim `@StateObject` is faster than `@ObservedObject`. The main distinction is ownership and lifetime.
+- Do not use offset identity for mutable or reorderable collections.
+- Do not create IDs with `UUID()` in an `id` computed property.
+- Do not claim `@StateObject` is a performance optimization over `@ObservedObject`; it is an ownership rule.
 - Do not claim Observation removes the need to think about identity. Observation changes dependency tracking, not identity rules.
 
-## 12. Minimal Checklist
+## Minimal checklist
 
 Before finishing an identity/state review, verify:
 
