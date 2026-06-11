@@ -1,119 +1,100 @@
 # Copy-on-Write and Large Values
 
-Use this reference when reviewing Swift code that uses large value types, standard library collections, custom copy-on-write storage, value-semantic wrappers around references, or mutation-heavy data pipelines.
+Use this reference when the task involves copy-on-write collections, large structs, repeated collection mutation, custom COW storage, uniqueness checks, or value-semantic API design.
 
-The goal is not to avoid value types. The goal is to understand when value semantics are cheap, when they hide reference-backed storage, when mutation triggers copying, and when a different ownership boundary would make performance and correctness clearer.
+The goal is not to avoid value types. The goal is to understand when value semantics are cheap, when they hide reference-backed storage, when mutation triggers copying, and when another ownership boundary would make performance and correctness clearer.
+
+## Contents
+
+- [Core model](#core-model)
+- [When to use this reference](#when-to-use-this-reference)
+- [Review workflow](#review-workflow)
+- [Common COW-backed values](#common-cow-backed-values)
+- [Mutation is the important boundary](#mutation-is-the-important-boundary)
+- [Repeated collection mutation](#repeated-collection-mutation)
+- [Large structs and snapshots](#large-structs-and-snapshots)
+- [Intermediate collections](#intermediate-collections)
+- [Custom COW storage](#custom-cow-storage)
+- [`isKnownUniquelyReferenced`](#isknownuniquelyreferenced)
+- [Thread safety and concurrency boundaries](#thread-safety-and-concurrency-boundaries)
+- [Evidence to look for](#evidence-to-look-for)
+- [Decision rules](#decision-rules)
+- [Common mistakes](#common-mistakes)
+- [Output guidance](#output-guidance)
 
 ## Core model
 
-Copy-on-write, or COW, is a storage strategy that lets a value type share backing storage until mutation.
+Copy-on-write, or COW, is a storage strategy where a value can share backing storage until mutation.
 
-The value behaves as if each copy were independent. Internally, the storage may be shared while values are only read. Before mutation, the implementation checks whether the storage is uniquely referenced. If it is not unique, the storage is copied first.
+At the API level, the value behaves as if each copy were independent. Internally, storage may be shared while values are only read. Before mutation, the implementation checks whether the storage is uniquely referenced. If it is not unique, the implementation copies storage first.
 
-This gives Swift value types a useful combination:
+Keep these models separate:
 
-* value semantics at the API level
-* cheap copies for read-only paths
-* deferred copying until mutation
-* predictable mutation semantics when implemented correctly
+- Value semantics means independent observable values.
+- COW means storage may be shared as an optimization.
+- Assignment may copy only a small value header.
+- Mutation after sharing may allocate and copy backing storage.
+- COW preserves value semantics only if shared mutable storage does not leak.
 
-Do not confuse the semantic model with the storage model:
+## When to use this reference
 
-* Value semantics means independent observable values.
-* COW means storage may be shared as an optimization.
-* Shared storage must not leak as shared mutable state.
-* Copying a value does not always copy its entire storage immediately.
-* Mutating a copied value may allocate and copy storage.
+Use this reference when code review or investigation involves:
 
-## Common COW-backed types
+- `Array`, `Dictionary`, `Set`, `String`, `Data`, or other value types with reference-backed storage;
+- large structs or large state snapshots;
+- repeated `map`, `filter`, `reduce`, `sorted`, `append`, `remove`, or subscript mutation in a hot path;
+- copy-then-mutate APIs such as `var next = state; next.items.append(...)`;
+- custom structs with private reference storage;
+- `isKnownUniquelyReferenced`;
+- replacing value types with classes for performance reasons;
+- actor methods, tasks, or closures moving large values around.
 
-Common Swift and Apple-platform value types often use reference-backed or COW-like storage internally.
+Do not use this reference for general algorithm complexity unless copy, storage, mutation, ownership, or allocation behavior is part of the issue.
 
-Examples include:
+## Review workflow
 
-* `Array`
-* `Dictionary`
-* `Set`
-* `String`
-* `Data`
-* custom structs with private reference storage
+1. 1Identify the value being copied, mutated, stored, or returned.
+2. 2Decide whether it is plain inline storage, standard COW storage, custom reference-backed storage, or a large snapshot.
+3. 3Locate the mutation boundary. COW costs usually appear at mutation after sharing, not at assignment alone.
+4. 4Check for intermediate collections, repeated derived copies, and predictable capacity growth.
+5. 5Check whether value semantics are required by the domain.
+6. 6Propose the smallest change that preserves ownership clarity.
+7. 7Recommend validation with allocation, time, SIL, benchmark, or signpost evidence.
 
-Do not assume every struct is COW-backed. Most ordinary structs store their fields directly. COW appears when the type is intentionally implemented with shared reference storage.
+## Common COW-backed values
 
-## First questions for review
+Common Swift and Apple-platform value types often use reference-backed or COW-like storage internally:
 
-Before recommending changes, ask:
+- `Array`
+- `Dictionary`
+- `Set`
+- `String`
+- `Data`
+- custom value types with private reference storage
 
-1. Is the value actually large?
-2. Is the value copied often?
-3. Is mutation performed after copying?
-4. Is the code in a measured hot path?
-5. Is allocation, buffer growth, or ARC traffic visible?
-6. Is storage shared intentionally or accidentally?
-7. Is the value passed through many architectural layers?
-8. Is the value stored in closures, tasks, actors, or type-erased wrappers?
-9. Is the proposed optimization preserving value semantics?
+Do not assume every struct is COW-backed. Most ordinary structs store their fields directly. COW appears when a type is intentionally implemented with shared reference storage.
 
-Do not replace value semantics with shared mutable reference semantics unless the model truly requires identity.
-
-## Copying is not always deep copying
-
-A copy of a COW value often copies a small header and shares backing storage.
-
-Example:
-
-```swift
-func keepOriginal(_ source: [ArticleID]) -> ([ArticleID], [ArticleID]) {
-    var edited = source
-    edited.append(.draft)
-
-    return (source, edited)
-}
-```
-
-The assignment to `edited` may be cheap. The `append` may still allocate or copy if the buffer is shared or if capacity must grow.
-
-Review questions:
-
-* Is the copy followed by mutation?
-* Is mutation repeated many times?
-* Is capacity sufficient?
-* Is the original value still needed?
-* Can mutation happen before sharing?
-* Can the algorithm avoid creating intermediate collections?
+Do not assume every value copy is expensive. For COW values, a copy may share storage until mutation. The suspicious path is usually repeated mutation, repeated buffer growth, or frequent large snapshot replacement.
 
 ## Mutation is the important boundary
 
-COW cost often appears at mutation points, not at assignment points.
-
-Look for patterns like:
+COW cost often appears at mutation points.
 
 ```swift
-func renameAll(_ folders: [Folder]) -> [Folder] {
-    var result = folders
-
-    for index in result.indices {
-        result[index].title = result[index].title.uppercased()
-    }
-
+func adding(_ item: Item, to items: [Item]) -> [Item] {
+    var result = items
+    result.append(item)
     return result
 }
 ```
 
-This may be fine. It becomes suspicious when:
+This shape is not automatically wrong. It becomes suspicious when `items` is large, the function runs frequently, the original value must stay alive, capacity growth repeats, or the same update could happen once at the owning boundary.
 
-* `folders` is large
-* the function runs frequently
-* each element is itself large or reference-backed
-* mutation triggers repeated storage checks
-* intermediate arrays are created before or after this function
-* the same transformation could happen at the owning boundary
+Prefer reviewing the whole pipeline rather than one assignment in isolation.
 
-Prefer reviewing the whole pipeline rather than this function in isolation.
+## Repeated collection mutation
 
-## Copy-then-mutate loops
-
-A common performance issue is repeated copy-then-mutate inside a loop.
+Repeated copy-then-mutate patterns can create unnecessary intermediate buffers.
 
 Risky shape:
 
@@ -131,7 +112,7 @@ func buildSections(from groups: [MessageGroup]) -> [Section] {
 }
 ```
 
-The problem is not that arrays are bad. The problem is that the algorithm repeatedly copies and extends values in a way that may create many intermediate buffers.
+The problem is not that arrays are bad. The problem is that the algorithm repeatedly derives a mutable value from another COW value, appends to it, and stores another copy.
 
 Prefer building each owned value directly:
 
@@ -155,28 +136,11 @@ func buildSections(from groups: [MessageGroup]) -> [Section] {
 }
 ```
 
-Review rule:
+Review rule: avoid repeatedly deriving a mutable copy from an existing COW value. Prefer constructing the final value at the ownership boundary.
 
-* Avoid repeatedly deriving a mutable copy from an existing COW value.
-* Prefer constructing the final value at the ownership boundary.
-* Reserve capacity when growth is predictable.
+## Large structs and snapshots
 
-## Large structs
-
-Large structs are not automatically wrong. They can be excellent when they model immutable snapshots or tightly grouped data.
-
-Be cautious when large structs are:
-
-* copied frequently
-* mutated after copying
-* captured by escaping closures
-* stored in arrays and repeatedly transformed
-* passed through existentials
-* sent across actor or task boundaries
-* composed of many COW-backed fields
-* used as UI state that changes in small pieces
-
-Example:
+Large structs are not automatically wrong. They are often the right model for immutable snapshots.
 
 ```swift
 struct PortfolioSnapshot {
@@ -187,123 +151,22 @@ struct PortfolioSnapshot {
 }
 ```
 
-This is a reasonable value model for an immutable snapshot. It may become expensive if every small alert change rebuilds and republishes the entire snapshot many times per second.
+This is a reasonable value model if the snapshot is created deliberately and consumed as a stable view of data. It may become expensive if every small update rebuilds, copies, publishes, or diffs the entire snapshot many times per second.
 
-Review questions:
+Ask:
 
-* Is the value intended to be an immutable snapshot?
-* Is only a small part changing?
-* Could the update be represented as a delta?
-* Can ownership be moved closer to the mutation site?
-* Is the whole value being captured or retained longer than needed?
+- Is the value intended to be an immutable snapshot?
+- Is only a small part changing?
+- Is the whole value captured by escaping closures or tasks?
+- Is the value sent across actor boundaries frequently?
+- Would a page, delta, or targeted update reduce copying and invalidation?
+- Would splitting state improve ownership, or only add complexity?
 
-## Large values in UI state
+Do not split large values blindly. Split when it reduces real copying, recomputation, invalidation, or lifetime retention.
 
-Large value types are common in UI state. They are useful because snapshots are easy to reason about, but broad invalidation and repeated copying can become expensive.
-
-Risky shape:
-
-```swift
-struct DashboardState {
-    var header: HeaderModel
-    var cards: [CardModel]
-    var filters: [FilterModel]
-    var timeline: [TimelineEvent]
-}
-
-func applyingFilter(_ state: DashboardState, filter: FilterModel) -> DashboardState {
-    var next = state
-    next.filters.append(filter)
-    next.timeline = recomputeTimeline(cards: next.cards, filters: next.filters)
-    return next
-}
-```
-
-This may be clear and correct. It becomes suspicious when used for high-frequency updates, scrolling, search-as-you-type, or animation-driven state.
-
-Possible improvements:
-
-* split high-frequency and low-frequency state
-* store derived data separately when recomputation dominates
-* apply diffs instead of replacing whole snapshots
-* keep mutation inside a single owner
-* avoid publishing a large state object for tiny changes
-
-Do not split state blindly. Split state when it reduces real copying, recomputation, or invalidation.
-
-## COW and ARC traffic
-
-COW storage is usually reference-backed. That means copies may still involve ARC traffic, even when the underlying buffer is not deep-copied.
-
-Look for:
-
-* repeated assignment of COW values in hot paths
-* COW values captured by escaping closures
-* COW values passed through type-erased wrappers
-* arrays of class instances
-* structs containing many reference-backed fields
-
-Example:
-
-```swift
-struct SearchPage {
-    var query: String
-    var results: [SearchResult]
-    var diagnostics: [DiagnosticEvent]
-}
-```
-
-Copying `SearchPage` may retain or release several backing storages. This is usually fine, but in a hot path it may show up as ARC traffic.
-
-Review rule:
-
-* COW reduces deep copy cost.
-* COW does not mean zero cost.
-* Check ARC and allocation evidence before changing the design.
-
-## Arrays of value types vs arrays of reference types
-
-An array's storage model is separate from the element model.
-
-```swift
-struct RenderCommand {
-    var rect: Rect
-    var opacity: Double
-}
-
-final class RenderNode {
-    var command: RenderCommand
-
-    init(command: RenderCommand) {
-        self.command = command
-    }
-}
-```
-
-An `[RenderCommand]` stores values in the array buffer. An `[RenderNode]` stores references in the array buffer, while nodes live as separate heap objects.
-
-Prefer value elements when:
-
-* identity is not required
-* mutation is controlled by the owning value
-* cache locality matters
-* snapshots are easier to reason about
-
-Prefer reference elements when:
-
-* identity is part of the model
-* shared mutable state is intentional
-* objects are large and stable
-* independent mutation is required
-* reference lifetime is already part of the design
-
-Do not choose based on "struct good, class bad." Choose based on semantics, mutation pattern, and evidence.
-
-## Avoid unnecessary intermediate collections
+## Intermediate collections
 
 Chained transformations can create intermediate arrays unless optimized away or expressed lazily.
-
-Potentially allocation-heavy shape:
 
 ```swift
 func visibleTitles(from items: [FeedItem]) -> [String] {
@@ -314,9 +177,9 @@ func visibleTitles(from items: [FeedItem]) -> [String] {
 }
 ```
 
-This may be perfectly acceptable for small data. For large or frequent pipelines, consider whether intermediate storage matters.
+This is fine for small or infrequent data. For large or frequent pipelines, consider whether intermediate storage matters.
 
-Possible alternatives:
+A direct loop can reduce temporary storage and make capacity explicit:
 
 ```swift
 func visibleTitles(from items: [FeedItem]) -> [String] {
@@ -332,119 +195,19 @@ func visibleTitles(from items: [FeedItem]) -> [String] {
 }
 ```
 
-Review rule:
+Do not rewrite every `map` or `filter` chain. Rewrite only when allocation, CPU, or repeated traversal is relevant.
 
-* Do not rewrite every `map` / `filter` chain.
-* Rewrite only when allocation or CPU cost matters.
-* Prefer clarity unless the pipeline is large, frequent, or measured as expensive.
+Lazy sequences can help when only part of the result is consumed, but they are not a default performance decoration. They can be slower when consumed multiple times, when abstraction blocks optimization, or when repeated traversal performs work again.
 
-## Lazy sequences
+## Custom COW storage
 
-Lazy sequences can avoid intermediate collections, but they are not always faster.
-
-They can help when:
-
-* the pipeline may stop early
-* intermediate arrays are large
-* only part of the result is consumed
-* the lazy abstraction remains visible to the optimizer
-
-They can hurt when:
-
-* the result is consumed multiple times
-* abstraction prevents optimization
-* the pipeline becomes harder to understand
-* repeated traversal performs work again
-
-Example:
-
-```swift
-func firstMatchingTitle(in items: [FeedItem]) -> String? {
-    items.lazy
-        .filter { $0.isVisible }
-        .map { $0.title }
-        .first { !$0.isEmpty }
-}
-```
-
-This can avoid building intermediate arrays because only the first matching title is needed.
-
-Review rule:
-
-* Use lazy pipelines when they match consumption.
-* Do not use lazy as a default performance decoration.
-
-## Reserving capacity
-
-When building arrays or dictionaries incrementally, reserve capacity when the final size is predictable.
-
-Example:
-
-```swift
-func makeRows(from models: [RowModel]) -> [RowViewModel] {
-    var rows: [RowViewModel] = []
-    rows.reserveCapacity(models.count)
-
-    for model in models {
-        rows.append(RowViewModel(model))
-    }
-
-    return rows
-}
-```
-
-This can reduce buffer reallocations during growth.
-
-Guardrails:
-
-* Do not reserve wildly inflated capacity.
-* Do not add capacity calculations that are more expensive than the savings.
-* Do not use `reserveCapacity` to hide a poor algorithm.
-* Measure when memory usage matters.
-
-## `inout` and mutation at the ownership boundary
-
-`inout` can express exclusive mutation of an existing value. It can help keep mutation at the owner boundary and avoid return-copy style APIs in some cases.
-
-Example:
-
-```swift
-func appendVisibleRows(
-    from items: [FeedItem],
-    into rows: inout [FeedRow]
-) {
-    for item in items where item.isVisible {
-        rows.append(FeedRow(item))
-    }
-}
-```
-
-This is useful when the caller owns the buffer and wants to build into it.
-
-Guardrails:
-
-* `inout` is not automatically faster.
-* The optimizer may already remove many temporary copies.
-* `inout` changes API shape and exclusivity constraints.
-* Use it when it clarifies ownership and mutation, not as a blanket optimization.
-
-## Custom COW types
-
-Custom COW is useful when a value type needs to manage large mutable storage while preserving value semantics.
-
-Typical shape:
+Custom COW is useful when a value type needs large mutable storage while preserving value semantics.
 
 ```swift
 struct DocumentBuffer {
     private var storage: Storage
 
-    init(lines: [Line]) {
-        self.storage = Storage(lines: lines)
-    }
-
-    var lines: [Line] {
-        storage.lines
-    }
+    var lines: [Line] { storage.lines }
 
     mutating func replaceLine(at index: Int, with line: Line) {
         makeUniqueStorage()
@@ -461,23 +224,22 @@ struct DocumentBuffer {
 private final class Storage {
     var lines: [Line]
 
-    init(lines: [Line]) {
-        self.lines = lines
-    }
-
-    func copy() -> Storage {
-        Storage(lines: lines)
-    }
+    init(lines: [Line]) { self.lines = lines }
+    func copy() -> Storage { Storage(lines: lines) }
 }
 ```
 
-Important properties:
+A custom COW type should have these properties:
 
-* storage is private
-* mutation goes through mutating methods
-* uniqueness is checked before mutation
-* copying storage preserves value semantics
-* reference storage does not leak through the public API
+- storage is private;
+- public API exposes values, not mutable storage identity;
+- mutation goes through `mutating` methods;
+- uniqueness is checked before mutation;
+- copied storage preserves the intended value semantics;
+- nested mutable references are copied or made immutable;
+- tests cover copy, mutation, aliasing, and boundary behavior.
+
+Do not add custom COW for small simple structs. The implementation complexity is justified only when storage size, mutation pattern, or API semantics make it worthwhile.
 
 ## `isKnownUniquelyReferenced`
 
@@ -485,118 +247,26 @@ Use `isKnownUniquelyReferenced` to check whether reference storage is uniquely o
 
 Correct mental model:
 
-* It works with class instances.
-* It is used through `inout` storage.
-* It answers whether the object is known to have a single strong reference.
-* A false result means the implementation should copy before mutation.
-* It does not make the storage thread-safe.
-* It must be used under normal Swift exclusivity and synchronization rules.
+- It works with class instances.
+- It is used through `inout` storage.
+- It answers whether the object is known to have a single strong reference.
+- A false result means the implementation should copy before mutation.
+- It does not make storage thread-safe.
+- It must be used under normal Swift exclusivity and synchronization rules.
 
 Guardrails:
 
-* Do not use it on public shared mutable storage as a synchronization mechanism.
-* Do not expose the storage object and still expect value semantics.
-* Do not skip deep copy of nested mutable references.
-* Do not assume weak or unowned references provide the ownership model you want.
-* Do not mutate storage before uniqueness is ensured.
+- Do not use it as synchronization.
+- Do not expose the storage object and still expect value semantics.
+- Do not mutate storage before uniqueness is ensured.
+- Do not skip deep copy of nested mutable references.
+- Do not use weak or unowned references to fake uniqueness semantics.
 
-## Deep copy requirements
+## Thread safety and concurrency boundaries
 
-A custom COW type must copy all mutable storage that participates in the value.
+COW is not a synchronization mechanism. It protects value semantics under normal exclusive access rules. It does not make concurrent mutation of the same variable safe.
 
-This copy is not always a trivial initializer call.
-
-Risky shape:
-
-```swift
-private final class GraphStorage {
-    var nodes: [Node]
-    var index: NodeIndex
-
-    func copy() -> GraphStorage {
-        GraphStorage(nodes: nodes, index: index)
-    }
-}
-```
-
-This is safe only if `Node` and `NodeIndex` preserve the intended value semantics. If they hide mutable references, this copy may still share nested mutable state.
-
-Review questions:
-
-* Does storage contain reference types?
-* Are nested references immutable?
-* If mutable, are they copied too?
-* Can callers observe shared mutation through nested objects?
-* Are cached indexes or derived data copied consistently?
-
-## Do not leak storage
-
-Custom COW breaks if callers can directly mutate shared reference storage.
-
-Risky shape:
-
-```swift
-struct ShapeList {
-    private var storage: Storage
-
-    var rawStorage: Storage {
-        storage
-    }
-}
-```
-
-This exposes the reference object and lets external code bypass uniqueness checks.
-
-Prefer safe accessors:
-
-```swift
-struct ShapeList {
-    private var storage: Storage
-
-    var shapes: [Shape] {
-        storage.shapes
-    }
-
-    mutating func append(_ shape: Shape) {
-        makeUniqueStorage()
-        storage.shapes.append(shape)
-    }
-}
-```
-
-Review rule:
-
-* Keep storage private.
-* Expose values, not mutable storage identity.
-* Route all mutations through uniqueness checks.
-
-## Thread safety and COW
-
-COW is not a synchronization mechanism.
-
-It protects value semantics under normal exclusive access rules. It does not make concurrent mutation of the same variable safe.
-
-Risky shape:
-
-```swift
-final class SharedStore {
-    var snapshot: [Record] = []
-}
-```
-
-If multiple threads mutate `snapshot` through the same `SharedStore` instance without synchronization, COW does not make it safe.
-
-Review rule:
-
-* Protect shared mutable owners with actor, lock, queue, or another synchronization strategy.
-* Treat COW as a storage optimization, not a data-race solution.
-* Ensure custom COW storage is mutated only through exclusive access.
-
-## COW across actor boundaries
-
-Returning a COW value from an actor gives the caller a value snapshot, but the storage may initially be shared internally until mutation.
-
-Example:
+Returning a COW value from an actor can be a valid snapshot API:
 
 ```swift
 actor MessageArchive {
@@ -608,122 +278,68 @@ actor MessageArchive {
 }
 ```
 
-This is usually fine. The caller cannot mutate the actor's `messages` property directly. If the caller mutates the returned array and storage is shared, COW should create separate storage.
+The caller cannot mutate the actor's stored property directly. If the caller mutates the returned array and storage is shared, COW should create separate storage.
 
-Potential costs:
+Potential costs include frequent large snapshots, ARC traffic from repeated snapshots, buffer copy on caller mutation, tasks retaining large values, and broad UI invalidation from replacing whole snapshots.
 
-* large snapshots returned frequently
-* ARC traffic from repeated snapshots
-* buffer copy on caller mutation
-* broad UI invalidation from replacing whole snapshots
+For deep concurrency design, route to `swift-concurrency-performance` if available. Use this reference only for the value/storage cost of moving large COW values across concurrency boundaries.
 
-Review questions:
-
-* Is a full snapshot necessary?
-* Would a page, diff, or query API reduce copying?
-* Is snapshot frequency causing allocation or ARC traffic?
-* Is caller mutation expected?
-
-## Large values and Sendable
-
-Large value types are often convenient to send across concurrency boundaries, but the cost model still matters.
-
-Check:
-
-* Is the value actually `Sendable`?
-* Does it contain reference-backed storage?
-* Does it contain non-Sendable reference state?
-* Is a large snapshot being copied or retained across tasks?
-* Does the receiving task mutate the value and trigger a deep copy?
-
-Do not mark reference-backed types as `Sendable` only to silence diagnostics. Preserve the actual ownership and thread-safety model.
-
-## Modern alternatives for specialized cases
-
-For specialized performance-sensitive code, consider newer ownership and storage tools only after measuring.
-
-Possible tools:
-
-* borrowing APIs to avoid unnecessary ownership traffic
-* consuming APIs when transfer of ownership is the model
-* noncopyable types when copying must be prevented
-* `Span` for temporary non-owning access to contiguous memory
-* `InlineArray` for fixed-size inline storage
-* `ManagedBuffer` for custom storage layouts
-
-Guardrails:
-
-* These tools can make APIs harder to use.
-* They are not replacements for ordinary value types.
-* They should be isolated behind clear abstractions when possible.
-* Prefer standard library containers unless measurement shows they are the bottleneck.
-
-## Signs to look for in Instruments
+## Evidence to look for
 
 In Allocations:
 
-* repeated array or dictionary growth
-* temporary collection creation
-* large buffer copies
-* custom storage copies
-* type-erased wrappers allocating around value storage
-* snapshot creation during scrolling or high-frequency updates
+- repeated array or dictionary growth;
+- temporary collection creation;
+- large buffer copies;
+- custom storage copies;
+- snapshot creation during scrolling or high-frequency updates;
+- type-erased wrappers allocating around value storage.
 
 In Time Profiler:
 
-* retain/release traffic around collection-heavy code
-* sorting or transformation dominating the pipeline
-* repeated uniqueness checks near mutation-heavy code
-* bridging or conversion between collection representations
-* expensive element copying or destruction
+- retain/release traffic around collection-heavy code;
+- sorting or transformation dominating the pipeline;
+- bridging or conversion between collection representations;
+- repeated mutation or copying near the hot path;
+- expensive element copying or destruction.
 
-In Swift Concurrency Instrument:
+In optimized SIL:
 
-* tasks retaining large snapshots
-* actor methods returning large values frequently
-* unbounded task groups multiplying value copies
-* MainActor work caused by copying or transforming large state
-
-## Signs to look for in optimized SIL
-
-Useful patterns:
-
-* `copy_value`: value copy
-* `destroy_value`: value destruction
-* `strong_retain` / `strong_release`: ARC traffic around storage
-* `alloc_ref`: custom COW storage allocation
-* `partial_apply`: closure capture that may retain large values
-* `apply`: calls that remain abstract or unspecialized
-* calls related to array/dictionary operations near the hot path
-* missed specialization around generic collection pipelines
+- `copy_value` and `destroy_value` around large values;
+- `strong_retain` / `strong_release` around COW storage;
+- `alloc_ref` for custom storage allocation;
+- `partial_apply` capturing large values;
+- calls that remain abstract or unspecialized in collection-heavy code.
 
 Use SIL to explain likely cost, not as the only proof. Prefer user-visible measurements when possible.
 
-## Common recommendations
+## Decision rules
 
-Prefer:
+- Preserve value semantics when they match the domain.
+- Optimize the mutation boundary before replacing values with references.
+- Build large values once at the owner boundary when possible.
+- Reserve capacity when growth is predictable and measured as relevant.
+- Avoid repeated copy-then-mutate loops in hot paths.
+- Keep custom COW storage private.
+- Check uniqueness before mutating reference storage.
+- Copy nested mutable reference state when it participates in the logical value.
+- Use reference identity only when identity, sharing, or independent mutation is part of the model.
+- Treat theoretical copies differently from measured hot-path costs.
 
-* preserving value semantics when they model the domain well
-* building large values once at the ownership boundary
-* reserving capacity for predictable growth
-* mutating in place when the caller clearly owns the value
-* avoiding repeated copy-then-mutate loops
-* using generics or concrete types in homogeneous hot paths
-* keeping custom COW storage private
-* checking uniqueness before mutation
-* copying nested mutable reference state when needed
-* measuring before replacing COW with reference identity
+## Common mistakes
 
-Avoid:
-
-* assuming every value copy is expensive
-* assuming COW is free
-* replacing value types with classes only to avoid hypothetical copies
-* exposing custom COW storage
-* using COW as thread synchronization
-* adding custom COW for small simple structs
-* adding unsafe buffers before measuring
-* rewriting clear collection pipelines without evidence
+- Assuming `struct` means no heap traffic.
+- Assuming every value copy is expensive.
+- Assuming COW is free.
+- Replacing value types with classes only to avoid hypothetical copies.
+- Publishing huge state snapshots for tiny high-frequency changes.
+- Rebuilding intermediate collections inside nested loops.
+- Adding custom COW for small simple values.
+- Exposing custom COW storage.
+- Using `isKnownUniquelyReferenced` as a thread-safety primitive.
+- Skipping nested mutable references during custom COW copy.
+- Rewriting clear collection pipelines without evidence.
+- Adding unsafe buffers before checking algorithm, capacity, and ownership boundaries.
 
 ## Output guidance
 
@@ -732,11 +348,11 @@ When this reference is used, include:
 ```markdown
 ## COW / large-value model
 
-Explain whether the relevant value is plain inline storage, COW-backed storage, custom reference-backed storage, or a large snapshot.
+Explain whether the relevant value is plain inline storage, standard COW storage, custom reference-backed storage, or a large snapshot.
 
 ## Suspected cost
 
-Identify copy-after-mutation, buffer growth, ARC traffic, custom storage copy, intermediate collections, actor snapshotting, or broad state replacement.
+Identify copy-after-sharing, buffer growth, ARC traffic, custom storage copy, intermediate collections, actor snapshotting, or broad state replacement.
 
 ## Why it matters
 
@@ -751,4 +367,4 @@ Suggest the smallest change that preserves value semantics and ownership clarity
 Recommend Allocations, Time Profiler, optimized SIL, signposts, XCTest performance tests, or a project benchmark.
 ```
 
-If the concern is theoretical and the value is not in a hot path, say so directly.
+If the concern is theoretical and the value is not in a hot path, say so directly. Do not recommend low-level rewrites without evidence.
