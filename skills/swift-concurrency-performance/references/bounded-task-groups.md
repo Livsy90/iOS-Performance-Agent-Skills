@@ -1,37 +1,71 @@
 # Bounded Task Groups
 
-Use this reference when reviewing `withTaskGroup`, `withThrowingTaskGroup`, large loops that create child tasks, batch processing, uploads, downloads, media processing, OCR, indexing, parsing, or any code that starts one task per input item.
+Use this reference when the task involves `withTaskGroup`, `withThrowingTaskGroup`, parallel mapping, fan-out work, batch processing, memory spikes, backend rate limits, or limiting concurrency.
 
-## Core Rule
+## Contents
 
-A task group gives structured concurrency for a dynamic number of child tasks. It does not automatically make the amount of concurrency safe.
+- [Core model](#core-model)
+- [When to use a task group](#when-to-use-a-task-group)
+- [When not to parallelize](#when-not-to-parallelize)
+- [Risky unbounded fan-out](#risky-unbounded-fan-out)
+- [Bounded concurrency pattern](#bounded-concurrency-pattern)
+- [Preserving input order](#preserving-input-order)
+- [Cancellation](#cancellation)
+- [Error behavior](#error-behavior)
+- [Choosing the limit](#choosing-the-limit)
+- [Diagnostics](#diagnostics)
+- [Review checklist](#review-checklist)
+- [Output guidance](#output-guidance)
 
-Creating one child task per item is fine for small inputs. For large or untrusted input sizes, it can create excessive work:
+## Core model
 
-* too many live tasks
-* memory pressure
-* scheduler overhead
-* too many network requests
-* service rate-limit failures
-* CPU contention
-* battery drain
-* worse responsiveness
+A task group gives structured concurrency for a dynamic number of child tasks.
 
-When input size can be large, use bounded concurrency.
+It does not automatically make the amount of concurrency safe.
 
-## When Not to Parallelize
+Creating one child task per item is acceptable when the input is small or externally bounded. When the input can be large, untrusted, or user-controlled, unbounded task creation can cause:
+
+- too many live tasks;
+- memory pressure;
+- scheduler overhead;
+- backend rate-limit failures;
+- CPU contention;
+- worse UI responsiveness;
+- downstream actor, database, or network contention.
+
+The core review question is:
+
+> Is the amount of concurrent work intentionally bounded?
+
+If the answer is no, treat the task group as a performance risk until proven otherwise.
+
+## When to use a task group
+
+Use a task group when:
+
+- the number of child operations is dynamic;
+- child operations are independent;
+- the parent operation owns the lifetime of all child work;
+- cancellation should propagate from parent to children;
+- the parent needs to aggregate child results.
+
+Use `async let` instead when the number of child operations is small, fixed, and known at compile time.
+
+Use ordinary sequential `await` when the operations depend on each other.
+
+## When not to parallelize
 
 Do not replace sequential awaits mechanically.
 
 Sequential awaits are correct when:
 
-* each step depends on the previous result
-* ordering is required
-* the resource is intentionally serial
-* parallel work would overload a service
-* the work is small enough that task overhead dominates
-* the caller needs predictable memory usage
-* the operation is already internally concurrent
+- each step depends on the previous result;
+- ordering is required;
+- the resource is intentionally serial;
+- the operation is already internally concurrent;
+- parallel work would overload a service;
+- task creation overhead would dominate the useful work;
+- predictable memory usage matters more than throughput.
 
 Risky rewrite:
 
@@ -41,9 +75,9 @@ async let token = refreshToken()
 async let data = fetchData(using: token)
 ```
 
-This is wrong if `fetchData` needs the refreshed token.
+This is wrong if `refreshToken` needs the session or `fetchData` needs the refreshed token.
 
-Prefer:
+Prefer sequential code when the dependency is real:
 
 ```swift
 let session = try await createSession()
@@ -53,165 +87,104 @@ let data = try await fetchData(using: token)
 
 Concurrency is useful only when the operations are actually independent.
 
-## `async let` vs Task Group
+## Risky unbounded fan-out
 
-Use `async let` for a small fixed set of independent operations:
-
-```swift
-async let profile = profileService.load()
-async let preferences = preferencesService.load()
-async let permissions = permissionsService.load()
-
-return try await UserContext(
-    profile: profile,
-    preferences: preferences,
-    permissions: permissions
-)
-```
-
-Use a task group when the number of child operations is dynamic:
+This pattern creates one child task per item:
 
 ```swift
-try await withThrowingTaskGroup(of: ImportedAsset.self) { group in
-    for descriptor in descriptors {
+try await withThrowingTaskGroup(of: EncodedClip.self) { group in
+    for clip in clips {
         group.addTask {
-            try await importAsset(descriptor)
+            try await encoder.encode(clip)
         }
     }
 
-    var imported: [ImportedAsset] = []
+    var output: [EncodedClip] = []
 
-    for try await asset in group {
-        imported.append(asset)
+    for try await encoded in group {
+        output.append(encoded)
     }
 
-    return imported
+    return output
 }
 ```
 
-This is acceptable only when `descriptors` is known to be small or externally bounded.
+This can be fine for a handful of clips. It is risky when `clips` can contain hundreds or thousands of items.
 
-## Risky Unbounded Pattern
+Common places to check:
 
-```swift
-func transcodeAll(_ clips: [VideoClip]) async throws -> [EncodedClip] {
-    try await withThrowingTaskGroup(of: EncodedClip.self) { group in
-        for clip in clips {
-            group.addTask {
-                try await encoder.encode(clip)
-            }
-        }
+- batch uploads or downloads;
+- image resizing or video transcoding;
+- OCR and PDF rendering;
 
-        var output: [EncodedClip] = []
+The problem is not task groups themselves. The problem is unbounded fan-out.
 
-        for try await encoded in group {
-            output.append(encoded)
-        }
-
-        return output
-    }
-}
-```
-
-If `clips` contains hundreds of items, this can start too much work.
-
-## Bounded Concurrency Pattern
+## Bounded concurrency pattern
 
 Start a limited number of child tasks. Each time one child completes, add one more.
 
 ```swift
-func transcodeAll(
-    _ clips: [VideoClip],
-    maxConcurrentJobs: Int = 3
-) async throws -> [EncodedClip] {
-    precondition(maxConcurrentJobs > 0)
-
+try await withThrowingTaskGroup(of: EncodedClip.self) { group in
     var iterator = clips.makeIterator()
-    var encodedClips: [EncodedClip] = []
+    var output: [EncodedClip] = []
 
-    try await withThrowingTaskGroup(of: EncodedClip.self) { group in
-        for _ in 0..<maxConcurrentJobs {
-            guard let clip = iterator.next() else { break }
+    for _ in 0..<maxConcurrentJobs {
+        guard let clip = iterator.next() else { break }
 
-            group.addTask {
-                try await encoder.encode(clip)
-            }
+        group.addTask {
+            try await encoder.encode(clip)
         }
+    }
 
-        while let encoded = try await group.next() {
-            encodedClips.append(encoded)
+    while let encoded = try await group.next() {
+        output.append(encoded)
 
-            if let nextClip = iterator.next() {
-                group.addTask {
-                    try await encoder.encode(nextClip)
-                }
+        if let nextClip = iterator.next() {
+            group.addTask {
+                try await encoder.encode(nextClip)
             }
         }
     }
 
-    return encodedClips
+    return output
 }
 ```
 
 This keeps at most `maxConcurrentJobs` child tasks active at once.
 
-## Preserving Input Order
+Review details:
+
+- validate that the limit is greater than zero;
+- avoid capturing large values inside the child closure;
+- avoid heavy aggregation on the `MainActor`;
+- avoid choosing a magic limit without explanation;
+- measure before claiming the limit is optimal.
+
+## Preserving input order
 
 Task group results arrive in completion order, not input order.
 
-If output order matters, include the index in the child task result:
+If output order matters, include the index in the child result and store each result at its original position.
 
 ```swift
-func renderPages(
-    _ pages: [PDFPage],
-    maxConcurrentJobs: Int = 4
-) async throws -> [PageImage] {
-    precondition(maxConcurrentJobs > 0)
+group.addTask {
+    let image = try await render(page)
+    return (index, image)
+}
 
-    var nextIndex = 0
-    var results = Array<PageImage?>(repeating: nil, count: pages.count)
-
-    try await withThrowingTaskGroup(of: (Int, PageImage).self) { group in
-        func addNextTaskIfNeeded() {
-            guard nextIndex < pages.count else { return }
-
-            let index = nextIndex
-            let page = pages[index]
-            nextIndex += 1
-
-            group.addTask {
-                let image = try await render(page)
-                return (index, image)
-            }
-        }
-
-        for _ in 0..<maxConcurrentJobs {
-            addNextTaskIfNeeded()
-        }
-
-        while let (index, image) = try await group.next() {
-            results[index] = image
-            addNextTaskIfNeeded()
-        }
-    }
-
-    return results.compactMap { $0 }
+while let (index, image) = try await group.next() {
+    results[index] = image
+    addNextTaskIfNeeded()
 }
 ```
 
-If missing results would be a bug, validate before returning:
-
-```swift
-guard results.allSatisfy({ $0 != nil }) else {
-    throw RenderError.missingPage
-}
-```
+Validate missing results before returning. Do not use `compactMap` silently if a missing result would hide a correctness bug.
 
 ## Cancellation
 
-Task groups are structured, but child tasks still need cooperative cancellation inside expensive work.
+Task groups are structured, so parent cancellation propagates to child tasks.
 
-Review child task bodies:
+But cancellation is cooperative. Child tasks must reach suspension points or explicitly check cancellation during expensive work.
 
 ```swift
 group.addTask {
@@ -225,52 +198,21 @@ group.addTask {
 If child work loops internally, cancellation checks should be inside the loop.
 
 ```swift
-func extractFrames(from video: VideoFile) async throws -> [Frame] {
-    var frames: [Frame] = []
-
-    for timestamp in video.timestamps {
-        try Task.checkCancellation()
-        frames.append(try await video.frame(at: timestamp))
-    }
-
-    return frames
+for timestamp in video.timestamps {
+    try Task.checkCancellation()
+    frames.append(try await video.frame(at: timestamp))
 }
 ```
 
-## Choosing the Limit
+Check cancellation when the user navigates away, a search query changes, the parent operation times out, one child fails, or child work performs CPU-heavy loops with few suspension points.
 
-There is no universal concurrency limit.
+Do not assume cancellation stops blocking synchronous work.
 
-Consider:
+## Error behavior
 
-* CPU count
-* memory footprint per task
-* API rate limits
-* network behavior
-* server-side limits
-* priority of the user action
-* battery impact
-* whether the task is CPU-bound or I/O-bound
-* whether the downstream dependency already throttles internally
+Use `withThrowingTaskGroup` when one child failure should fail the whole operation.
 
-Typical starting points:
-
-* CPU-heavy image/video work: small limit
-* network requests to the same backend: respect API and server limits
-* local parsing of many small files: measure
-* user-visible work: prefer responsiveness over maximum throughput
-
-Do not hard-code a magic number without a reason. A small default plus measurement is usually better than unbounded concurrency.
-
-## Error Behavior
-
-In a throwing task group, the first thrown error observed by the parent can cause remaining work to be cancelled when exiting the group.
-
-Review whether that behavior is desired.
-
-Use throwing groups when one failure should fail the whole operation.
-
-Use non-throwing groups with per-item `Result` when partial success is valid:
+Use a non-throwing group with per-item `Result` when partial success is valid:
 
 ```swift
 await withTaskGroup(of: ImportResult.self) { group in
@@ -290,46 +232,69 @@ await withTaskGroup(of: ImportResult.self) { group in
 }
 ```
 
-## Priority
+For large input, combine per-item results with bounded concurrency.
 
-Prefer structured child tasks so priority and cancellation follow the parent operation.
+## Choosing the limit
 
-Avoid replacing task-group children with `Task.detached` unless the work is intentionally independent.
+There is no universal concurrency limit.
 
-If child work is lower priority than the parent, make that explicit and explain why.
+Choose a starting point based on:
+
+- CPU count;
+- memory footprint per child task;
+- API rate limits;
+- server-side limits;
+- network behavior;
+- database or actor contention;
+- priority of the user action;
+- whether the work is CPU-bound or I/O-bound;
+
+Typical starting points:
+
+- CPU-heavy image or video work: use a small limit;
+- network requests to the same backend: respect backend and API limits;
+- database work: avoid parallelism that only creates lock contention;
+
+Do not hard-code a magic number without a reason. A conservative default plus measurement is usually better than unbounded concurrency.
 
 ## Diagnostics
 
-Use Instruments or logging when task-group behavior is unclear.
+Use Instruments, signposts, logging, and memory tools when task-group behavior is unclear.
 
-Look for:
+| Symptom | Likely cause |
+|---|---|
+| Many live tasks | Unbounded group or input size not constrained |
+| Memory spike | Too many active child tasks or large captured values |
+| Rate-limit failures | Concurrency limit too high |
+| No speedup | Bottleneck is serialized elsewhere |
+| UI stalls | Child work or result aggregation is hitting `MainActor` |
+| High CPU with poor throughput | Oversubscription, contention, or blocking work |
+| Work continues after navigation | Parent task lifetime is wrong or cancellation is ignored |
 
-* high number of live tasks
-* memory spikes during batch processing
-* slow UI while task group is active
-* backend rate-limit errors
-* child tasks that continue after the screen is gone
-* no throughput improvement despite more tasks
-* many tasks blocked on the same actor or dependency
+When the user provides a trace, connect each recommendation to an observable signal.
 
-Map symptoms to code:
+## Review checklist
 
-* many live tasks → unbounded group
-* memory spike → too many active child tasks or large captured values
-* rate-limit failures → concurrency limit too high
-* no speedup → bottleneck is serialized elsewhere
-* UI stalls → child work or result aggregation hitting MainActor
+Before recommending a task-group change, check:
 
-## Review Checklist
+- [ ] Is the input size bounded?
+- [ ] Is each child operation independent?
+- [ ] Is output order important?
+- [ ] Does the code create one task per item?
+- [ ] Should concurrency be limited?
+- [ ] Is the selected limit justified?
+- [ ] Is cancellation checked inside expensive child work?
+- [ ] Are errors all-or-nothing or per-item?
+- [ ] Are large captures avoided in child task closures?
+- [ ] Does result aggregation happen off the `MainActor` when heavy?
 
-* [ ] Is the input size bounded?
-* [ ] Is each child operation independent?
-* [ ] Is output order important?
-* [ ] Does the code create one task per item?
-* [ ] Should concurrency be limited?
-* [ ] Is cancellation checked inside expensive child work?
-* [ ] Are errors all-or-nothing or per-item?
-* [ ] Are large captures avoided in child task closures?
-* [ ] Does aggregation happen off MainActor when heavy?
-* [ ] Is the selected concurrency limit justified?
-* [ ] Is the performance benefit measured?
+## Output guidance
+
+When this reference applies, the answer should include:
+
+1. whether the current task group is bounded or unbounded;
+2. why the input size or downstream dependency makes that safe or risky;
+3. whether operations are independent enough to parallelize;
+4. whether output order, cancellation, and error behavior are correct;
+5. the smallest safe refactor;
+6. a validation step.
