@@ -1,527 +1,148 @@
 ---
-
 name: swift-concurrency-performance
-description: Use this skill when reviewing or diagnosing Swift Concurrency code for performance, responsiveness, MainActor overuse, actor contention, task lifecycle bugs, unbounded child tasks, blocking work inside async contexts, cancellation propagation, AsyncSequence resource cleanup, continuation safety, Swift 6.2 isolation behavior, or Swift Concurrency Instruments findings.
-
+description: Use this skill when reviewing Swift Concurrency performance and responsiveness, including task explosions, actor hopping, MainActor bottlenecks, cancellation, AsyncSequence cleanup, continuations, reentrancy, executor behavior, blocking async work, or async work that affects UI latency. Do not use it for general async/await syntax questions unless performance, responsiveness, cancellation, or lifetime is part of the task.
 ---
 
 # Swift Concurrency Performance
 
-Use this skill to review Swift Concurrency code with a focus on responsiveness, resource usage, task lifetime, actor isolation, cancellation, and measurable performance behavior.
+## Purpose
+
+Use this skill to review, diagnose, and improve Swift Concurrency code when async work affects UI responsiveness, throughput, memory, cancellation, task lifetime, actor contention, or correctness under load.
+
+This skill is not a general Swift Concurrency tutorial. It is a performance and responsiveness review workflow.
+
+## When to use this skill
+
+Use this skill when the task involves:
+
+* UI stalls, slow interactions, hangs, or frame drops related to async work;
+* excessive `Task` creation, task groups, detached tasks, or unstructured concurrency;
+* `MainActor` bottlenecks, actor hopping, actor queue buildup, or actor contention;
+* cancellation that does not stop work, navigation leaks, or tasks outliving their owner;
+* `AsyncSequence`, `AsyncStream`, long-running streams, buffering, or producer cleanup;
+* continuation bridges, delegate/callback wrappers, or async wrappers around legacy APIs;
+* blocking calls inside async contexts, semaphores, synchronous I/O, locks, or cooperative pool starvation;
+* actor reentrancy, duplicate in-flight work, cache stampedes, or inconsistent actor state after `await`;
+* Swift 6.2 isolation behavior, explicit isolation, `@concurrent`, `nonisolated`, or Sendable boundaries;
+* Instruments traces, logs, or production signals that point to concurrency-related latency, memory growth, or throughput loss.
+
+## When not to use this skill
+
+Do not use this skill for:
+
+* basic `async`/`await` syntax questions with no performance, lifetime, or responsiveness concern;
+* general architecture discussions where concurrency is not part of the critical path;
+* purely SwiftUI rendering issues unless async lifecycle work contributes to the symptom;
+* launch performance unless async startup work, task lifetime, or actor isolation is part of the launch path;
+* runtime-level allocation, ARC, generics, or existential costs unless they interact with concurrency behavior;
+* server-side concurrency questions unless the task is specifically about Swift Concurrency performance patterns.
+
+Prefer another skill when a more specific domain dominates the task:
+
+* use `ios-launch-performance` for app startup, first frame, first interaction, pre-main, dyld, or SDK launch work;
+* use `swiftui-performance` for SwiftUI invalidation, identity, layout, scrolling, or body cost;
+* use `ios-performance-profiling` when the main task is choosing or interpreting profiling tools;
+* use `swift-runtime-performance` for allocations, ARC traffic, dispatch, existentials, generics, or copy-on-write costs.
+
+## Core workflow
+
+1. Identify the user-visible symptom: UI stall, slow interaction, low throughput, memory growth, duplicate work, leaked task, missed cancellation, actor contention, or blocked cooperative threads.
+2. Locate the async boundary: `Task`, task group, actor method, `MainActor`, continuation, stream, lifecycle callback, delegate bridge, or legacy blocking API.
+3. Determine the lifetime owner: view, view model, service, actor, request, app session, stream consumer, or detached background process.
+4. Separate required work from optional or deferrable work.
+5. Check whether concurrency is being used to express structure, isolation, and cancellation rather than as a vague performance fix.
+6. Look for blocking work inside async contexts.
+7. Check whether work that affects UI state is isolated narrowly and whether CPU-heavy work is kept off the main actor.
+8. Check cancellation propagation, especially across task groups, streams, continuations, loops, and navigation lifetimes.
+9. Check for actor reentrancy after every `await` inside actor-isolated methods.
+10. Propose the smallest safe change that improves lifetime, cancellation, isolation, or throughput.
+11. Include a validation path before calling the change a performance improvement.
+
+## Decision rules
+
+* Treat `async` as suspension, not as automatic background execution.
+* Do not assume concurrency improves performance. More tasks can increase scheduling overhead, memory pressure, actor contention, and cancellation complexity.
+* Prefer structured concurrency when the parent owns the lifetime of the work.
+* Use unstructured tasks only when the lifetime is deliberately independent and cancellation ownership is explicit.
+* Use `Task.detached` only as an explicit escape hatch from inherited context, priority, task-local values, and actor isolation.
+* Bound parallel work when the input size can grow.
+* Keep `MainActor` work short and focused on UI state, presentation coordination, and main-thread-only APIs.
+* Move CPU-heavy work outside main-actor isolation, but do not cross isolation boundaries casually.
+* Batch actor calls on hot paths when repeated hops dominate latency.
+* After an `await` inside an actor, assume actor state may have changed.
+* Use checked continuations by default and verify every path resumes exactly once.
+* Treat stream termination and producer cleanup as part of the API contract.
+* Prefer cancellation-aware loops and pipelines for long-running or high-volume work.
+* Connect every performance claim to evidence or a validation plan.
+
+## Gotchas
+
+* Do not recommend adding `async` or `Task` simply because code is slow.
+* Do not move work off the `MainActor` if the API or UI state must remain main-actor isolated.
+* Do not leave CPU-heavy computation in a `@MainActor` type just because the type also owns UI state.
+* Do not use `Task.detached` to silence isolation errors without explaining the lifetime, cancellation, priority, and data-safety consequences.
+* Do not create one child task per item for large or unbounded collections without limiting concurrency.
+* Do not swallow cancellation with broad `catch` blocks.
+* Do not assume cancelling a parent automatically stops legacy callbacks, streams, delegates, or manually retained producers.
+* Do not wrap a blocking API in `async` if the underlying work still blocks a cooperative executor thread.
+* Do not treat actor isolation as a duplicate-work prevention mechanism when the actor method suspends during a cache miss.
+* Do not use unsafe continuations unless profiling shows checked continuation overhead matters and the resume contract is proven.
+* Do not call an optimization successful without before/after validation.
+
+## Reference routing
+
+Read these only when relevant:
+
+* `references/concurrency-runtime.md` — read when the task needs the mental model for tasks, suspension, cooperative executors, actor executors, priorities, structured concurrency, or why blocking async code is harmful.
+* `references/mainactor-responsiveness.md` — read when the task involves `MainActor`, `@MainActor` types, UI state, view models, main-thread stalls, `@concurrent`, or moving CPU-heavy work away from UI isolation.
+* `references/task-lifetime-and-structure.md` — read when the task involves structured concurrency, unstructured tasks, task ownership, `Task {}`, `Task.detached`, view/view-model lifetimes, or tasks that outlive their owner.
+* `references/cancellation-and-task-lifetime.md` — read when the task involves navigation cancellation, long-running work, cancellation propagation, cancellation swallowed by `catch`, task groups, streams, or cancellation tests.
+* `references/bounded-task-groups.md` — read when the task involves `withTaskGroup`, `withThrowingTaskGroup`, parallel mapping, fan-out work, memory spikes, or limiting concurrency.
+* `references/actor-reentrancy.md` — read when the task involves actor-isolated state, duplicate network requests, cache stampedes, state checks before and after `await`, or actor queue buildup.
+* `references/swift-6-2-isolation.md` — read when the task involves Swift 6.2 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
+* `references/blocking-legacy-apis.md` — read when the task involves semaphores, synchronous file I/O, blocking networking, locks, callback APIs, old SDKs, or async wrappers around blocking work.
+* `references/continuation-safety.md` — read when the task involves `withCheckedContinuation`, `withCheckedThrowingContinuation`, delegate bridges, callback wrappers, timeout paths, cancellation paths, or exactly-once resume guarantees.
+* `references/asyncsequence-and-stream-cleanup.md` — read when the task involves `AsyncSequence`, `AsyncStream`, `AsyncThrowingStream`, long-running streams, buffering, producer lifetime, `onTermination`, or `for await` loops.
+* `references/diagnostics-and-instruments.md` — read when the user provides traces, logs, measurements, production signals, or asks how to validate concurrency-related performance changes.
+
+## Validation expectations
 
-This skill is not a general async/await tutorial. Apply it when the user asks about concurrency-related performance, UI hangs, actor bottlenecks, task creation patterns, cancellation behavior, async streams, continuations, or Swift Concurrency diagnostics.
+Recommend validation that matches the suspected issue:
 
-## Review Principles
+* use Instruments when the symptom involves UI stalls, actor contention, task lifetime, blocked threads, or high task counts;
+* use signposts when comparing before/after latency across async boundaries;
+* use cancellation tests when work should stop after navigation, deallocation, timeout, or parent cancellation;
+* use memory graphs or allocation instruments when streams, task groups, or long-lived tasks may retain producers or large values;
+* use logs with task identifiers or request identifiers when checking duplicate in-flight work;
+* use XCTest performance tests only when the workload is repeatable enough to produce meaningful comparisons;
+* use production metrics when local traces cannot reproduce tail latency or rare stuck tasks.
 
-Start from the smallest useful diagnosis.
+Do not present a concurrency refactor as a performance win unless there is a clear validation path.
 
-Do not add concurrency blindly. Async tasks, actors, task groups, and detached work are not performance improvements by themselves. Recommend them only when there is a clear reason: latency hiding, parallelism, isolation, responsiveness, cancellation control, or lifetime management.
-
-Prefer simple synchronous code when the work is local, fast, already on the correct isolation domain, and does not block a critical executor.
-
-Before proposing a rewrite, classify the issue:
-
-* UI responsiveness problem
-* too much work on `MainActor`
-* blocking call inside async code
-* actor contention or excessive actor hops
-* duplicate work caused by actor reentrancy
-* too many child tasks
-* missing cancellation checks
-* unstructured task lifetime leak
-* unsafe continuation bridge
-* async stream that does not release resources
-* Swift 6.2 isolation behavior keeping work on the caller’s actor
-
-When possible, ask for evidence: Instruments trace, logs, reproducible scenario, cancellation path, affected screen, or the specific async call chain.
-
-## References
-
-Read these only when the task requires deeper guidance:
-
-* `references/actor-reentrancy.md` — actor methods with `await`, cache coordination, duplicate work, state validation after suspension, in-flight tasks, or actor contention.
-* `references/bounded-task-groups.md` — task groups over large collections, batch processing, dynamic child tasks, ordering, throttling, cancellation, partial failure, or concurrency limit selection.
-* `references/swift-6-2-isolation.md` — Swift 6.2+, `@MainActor`, default actor isolation, `nonisolated`, `@concurrent`, Sendable boundary checks, snapshots, or CPU work that may stay on the caller’s actor.
-
-## Runtime Rule: Suspend, Do Not Block
-
-Swift tasks are expected to suspend at suspension points. A suspended task lets the executor make progress on other work. Blocking a thread used by Swift Concurrency can reduce throughput for unrelated tasks and can make hangs harder to diagnose.
-
-Flag blocking patterns inside async contexts:
-
-```swift
-Thread.sleep(forTimeInterval: 0.5)
-gate.wait()
-queue.sync { performWork() }
-let bytes = try Data(contentsOf: fileURL)
-legacyClient.fetchSynchronously()
-```
-
-Prefer async or suspending alternatives:
-
-```swift
-try await Task.sleep(for: .milliseconds(500))
-let bytes = try await fileLoader.read(fileURL)
-let response = try await client.fetch()
-```
-
-Do not hold a lock across an `await`.
-
-A short lock-protected critical section can be reasonable for tiny synchronous state, but long-held or highly contended locks inside async tasks are a performance smell. Do not replace every lock with an actor by default; choose the primitive that matches the lifetime and API shape.
-
-## MainActor Responsiveness
-
-Use `MainActor` for UI state, presentation state, and short coordination. Keep heavy computation away from it.
-
-Watch for:
-
-* parsing large payloads on `MainActor`
-* formatting large collections on `MainActor`
-* image processing on `MainActor`
-* sorting/filtering large arrays on `MainActor`
-* building large view models synchronously on `MainActor`
-* running database or file operations from `MainActor`
-
-Risky:
-
-```swift
-@MainActor
-final class PortfolioScreenModel {
-    private(set) var rows: [PortfolioRow] = []
-
-    func reload() async throws {
-        let positions = try await positionsAPI.loadPositions()
-        rows = positions
-            .map { PortfolioRow(position: $0) }
-            .sorted { $0.displayName < $1.displayName }
-    }
-}
-```
-
-The network request suspends, but the mapping and sorting still happen on the main actor.
-
-Prefer moving heavy work out of the main actor boundary:
-
-```swift
-@MainActor
-final class PortfolioScreenModel {
-    private(set) var rows: [PortfolioRow] = []
-
-    func reload() async throws {
-        let positions = try await positionsAPI.loadPositions()
-        rows = await makeRows(from: positions)
-    }
-}
-
-@concurrent
-func makeRows(from positions: [Position]) async -> [PortfolioRow] {
-    positions
-        .map { PortfolioRow(position: $0) }
-        .sorted { $0.displayName < $1.displayName }
-}
-```
-
-When recommending `@concurrent`, check that captured values, parameters, and return types can safely cross isolation boundaries. Prefer `Sendable` value types. Do not use `@concurrent` to move non-Sendable UI-owned reference models away from `MainActor`.
-
-For long CPU-heavy work, `@concurrent` only moves execution away from the caller’s actor. It does not automatically make the computation cooperative. Long computations may still need chunking, cancellation checks, yielding, or a dedicated execution mechanism.
-
-Avoid `DispatchQueue.main.async` from code that is already isolated to `MainActor`. After suspension, a `@MainActor` function resumes on the main actor.
-
-Use `MainActor.run` when only a small section of otherwise non-main work must update UI state.
-
-For deeper Swift 6.2 isolation behavior, read `references/swift-6-2-isolation.md`.
-
-## Structured Concurrency by Default
-
-Prefer structured concurrency when the child work belongs to the caller’s scope.
-
-Use `async let` for a small fixed set of independent operations:
-
-```swift
-async let account = accountService.currentAccount()
-async let limits = limitsService.dailyLimits()
-async let alerts = alertsService.activeAlerts()
-
-let summary = try await AccountSummary(
-    account: account,
-    limits: limits,
-    alerts: alerts
-)
-```
-
-Use a task group when the amount of child work is dynamic.
-
-Do not mechanically parallelize sequential `await`s. Sequential awaits are correct when the next operation depends on the previous result, when ordering matters, when a resource must be used serially, or when parallelism would overload a service.
-
-Risky unstructured task:
-
-```swift
-func userDidPullToRefresh() {
-    Task {
-        await refreshContent()
-    }
-}
-```
-
-If this task belongs to the lifetime of an object, store it and cancel it when it is no longer needed:
-
-```swift
-private var refreshJob: Task<Void, Never>?
-
-func userDidPullToRefresh() {
-    refreshJob?.cancel()
-    refreshJob = Task {
-        await refreshContent()
-    }
-}
-
-func close() {
-    refreshJob?.cancel()
-    refreshJob = nil
-}
-```
-
-Use `Task.detached` only when the work is intentionally independent from the caller’s actor, cancellation, priority, and task-local context. Treat it as an escape hatch, not as a default way to “move work to background”.
-
-## Bounded Child Tasks
-
-A task group can still create too much work.
-
-Risky pattern:
-
-```swift
-try await withThrowingTaskGroup(of: ReceiptText.self) { group in
-    for scan in scans {
-        group.addTask {
-            try await recognizeText(in: scan)
-        }
-    }
-
-    for try await text in group {
-        recognizedTexts.append(text)
-    }
-}
-```
-
-This may create excessive memory pressure, scheduling overhead, or service load when `scans` is large.
-
-For large input collections, recommend bounded concurrency: start only a limited number of child tasks, then add a new task each time one completes.
-
-Use bounded concurrency for batch uploads, downloads, image processing, OCR, parsing, indexing, compression, and other large collections.
-
-For full bounded-concurrency patterns, ordering, cancellation, partial failure, and limit selection, read `references/bounded-task-groups.md`.
-
-## Cancellation
-
-Cancellation is cooperative state. The task must observe it.
-
-Add cancellation checks before expensive work and inside long loops:
-
-```swift
-func indexDocuments(_ documents: [Document]) async throws -> SearchIndex {
-    var builder = SearchIndexBuilder()
-
-    for document in documents {
-        try Task.checkCancellation()
-        try await builder.add(document)
-    }
-
-    return builder.build()
-}
-```
-
-Do not hide cancellation accidentally.
-
-Risky:
-
-```swift
-func cachedPreview() async -> Preview? {
-    try? await previewService.makePreview()
-}
-```
-
-This collapses cancellation, failure, and absence of value into the same result.
-
-Prefer preserving cancellation when the caller needs to react:
-
-```swift
-func cachedPreview() async throws -> Preview {
-    try await previewService.makePreview()
-}
-```
-
-Use `withTaskCancellationHandler` when bridging an API that exposes a specific cancellation handle. Cancel that operation, not a global shared service.
-
-If an operation is expensive and cannot be cancelled internally, make that limitation explicit in the review.
-
-## Actor Isolation, Reentrancy, and Duplicate Work
-
-Actors protect isolated state from data races. They do not make an entire async method atomic.
-
-Every `await` inside an actor-isolated method is a reentrancy boundary. While the method is suspended, another call can enter the actor and observe or mutate actor state.
-
-Watch for:
-
-* cache miss followed by `await`
-* state validation before `await`
-* mutation after `await`
-* duplicate network, decoding, parsing, or indexing work
-* actor methods that combine coordination and expensive work
-* hot actor methods called once per item in a large loop
-
-Prefer:
-
-* committing actor state before suspension when correct
-* re-validating actor state after suspension when needed
-* tracking in-flight work when deduplication matters
-* batching hot actor calls
-* moving pure computation to `nonisolated` code
-* reducing the isolated section instead of making the whole workflow actor-isolated
-
-Use `nonisolated` only when a method does not read or mutate actor-isolated state.
-
-Do not split state into many actors just to increase parallelism unless the split matches the consistency model. Too many actors can create excessive hops and make correctness harder to reason about.
-
-For detailed reentrancy examples, in-flight task patterns, state validation, and actor contention guidance, read `references/actor-reentrancy.md`.
-
-## Swift 6.2 and Explicit Isolation
-
-In Swift 6.2 and later, do not assume that `async` means “background”.
-
-Check the isolation context:
-
-* Is the caller on `MainActor`?
-* Is the enclosing type actor-isolated?
-* Does the function inherit the caller’s actor?
-* Does the heavy work need to explicitly switch off the caller’s actor?
-* Are values crossing the boundary `Sendable`?
-
-Use `nonisolated` for code that does not need actor-isolated state.
-
-Use `@concurrent` when an async function should explicitly switch off the caller’s actor so that actor can continue making progress.
-
-Before recommending `@concurrent`, verify that parameters, captures, and return values can safely cross isolation boundaries. Prefer value types that conform to `Sendable`.
-
-Do not add `@concurrent` everywhere. Use it when there is a concrete isolation or responsiveness problem.
-
-For detailed Swift 6.2 behavior, Sendable boundary checks, snapshots, and refactoring patterns, read `references/swift-6-2-isolation.md`.
-
-## Blocking Legacy APIs
-
-Do not run meaningful blocking work directly inside async tasks.
-
-Risky:
-
-```swift
-func loadArchive() async throws -> Archive {
-    try archiveReader.readSynchronously()
-}
-```
-
-Prefer a native async API when one exists.
-
-If the API is inherently blocking, run it outside the Swift Concurrency cooperative pool and bridge the result back:
-
-```swift
-func loadArchive() async throws -> Archive {
-    try await withCheckedThrowingContinuation { continuation in
-        archiveQueue.async {
-            do {
-                let archive = try archiveReader.readSynchronously()
-                continuation.resume(returning: archive)
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
-    }
-}
-```
-
-If the legacy API provides a cancellation token, handle, or operation object, pair the bridge with cancellation handling. Cancel the specific operation, not a shared service.
-
-Use this pattern only for truly blocking APIs. Do not wrap already-async APIs in queues.
-
-## Continuation Safety
-
-Prefer checked continuations by default.
-
-For `withCheckedContinuation` and `withCheckedThrowingContinuation`, verify that every possible path resumes exactly once.
-
-Review:
-
-* success path
-* failure path
-* timeout path
-* cancellation path
-* early return path
-* delegate callback path
-* invalid input path
-
-Risky:
-
-```swift
-func exportReport() async throws -> ExportedReport {
-    try await withCheckedThrowingContinuation { continuation in
-        exporter.start { output, failure in
-            if let output {
-                continuation.resume(returning: output)
-            }
-
-            if let failure {
-                continuation.resume(throwing: failure)
-            }
-        }
-    }
-}
-```
-
-If both values are present or both are nil, this may resume incorrectly.
-
-Prefer a single explicit result path:
-
-```swift
-func exportReport() async throws -> ExportedReport {
-    try await withCheckedThrowingContinuation { continuation in
-        exporter.start { result in
-            switch result {
-            case .finished(let report):
-                continuation.resume(returning: report)
-            case .failed(let error):
-                continuation.resume(throwing: error)
-            }
-        }
-    }
-}
-```
-
-Use unsafe continuations only when profiling shows checked continuation overhead matters.
-
-## AsyncSequence and AsyncStream
-
-When reviewing async streams, check lifetime, cancellation, buffering, and cleanup.
-
-Risky:
-
-```swift
-func paymentEvents() -> AsyncStream<PaymentEvent> {
-    AsyncStream { continuation in
-        paymentMonitor.onEvent = { event in
-            continuation.yield(event)
-        }
-
-        paymentMonitor.start()
-    }
-}
-```
-
-The producer may continue running after the consumer stops.
-
-Prefer explicit termination cleanup:
-
-```swift
-func paymentEvents() -> AsyncStream<PaymentEvent> {
-    AsyncStream { continuation in
-        paymentMonitor.onEvent = { event in
-            continuation.yield(event)
-        }
-
-        continuation.onTermination = { _ in
-            paymentMonitor.stop()
-        }
-
-        paymentMonitor.start()
-    }
-}
-```
-
-If the producer object is created inside the stream builder, ensure it remains alive for the lifetime of the stream and is released on termination.
-
-For high-frequency streams, check buffering behavior. Avoid unbounded memory growth when the producer is faster than the consumer.
-
-Inside long-running `for await` loops, check cancellation when doing expensive per-element work:
-
-```swift
-for await update in updates {
-    try Task.checkCancellation()
-    await apply(update)
-}
-```
-
-## Diagnostics
-
-Use Instruments when code review alone is insufficient.
-
-Look for:
-
-* long work on `MainActor`
-* actor queues with growing wait time
-* high number of created or alive tasks
-* tasks that survive longer than their owner
-* blocked cooperative threads
-* continuations that never resume
-* async streams that keep producers alive
-* excessive actor hops on hot paths
-
-Map symptoms to likely causes:
-
-* UI stall → heavy work on `MainActor` or blocking call on the main path
-* actor queue buildup → hot actor, long isolated section, or chatty actor API
-* duplicate network work → actor reentrancy without in-flight tracking
-* memory spike → unbounded task group or unbounded stream buffering
-* ignored navigation cancellation → task not stored, not cancelled, or cancellation swallowed
-* stuck task → continuation not resumed or stream never terminates
-* low throughput with busy threads → blocking legacy API, semaphore wait, sync file I/O, or lock contention
-
-When the user provides a trace, connect every recommendation to an observable symptom.
-
-## Code Review Checklist
-
-Before finalizing a recommendation, check:
-
-* [ ] Is concurrency being added for a clear reason?
-* [ ] Is `MainActor` limited to UI state and short coordination?
-* [ ] Is CPU-heavy work outside main-actor isolation?
-* [ ] Are values crossing isolation boundaries safe to send?
-* [ ] Are blocking calls absent from async contexts?
-* [ ] Are large task groups bounded?
-* [ ] Are sequential awaits only parallelized when independence is clear?
-* [ ] Are unstructured tasks stored and cancelled when their lifetime is owned?
-* [ ] Is `Task.detached` used only as an explicit escape hatch?
-* [ ] Does cancellation propagate instead of being swallowed?
-* [ ] Are long loops and expensive pipelines cancellation-aware?
-* [ ] Are actor methods free from unnecessary long isolated work?
-* [ ] Are actor hops batched on hot paths?
-* [ ] Is actor reentrancy considered after every `await`?
-* [ ] Is duplicate work prevented when actor methods suspend during cache misses?
-* [ ] Are continuations resumed exactly once?
-* [ ] Do async streams clean up producers on termination?
-* [ ] Is Swift 6.2 isolation behavior considered?
-* [ ] Is the recommendation validated by measurement when performance impact is uncertain?
-
-## Output Format
+## Output expectations
 
 When reviewing code, respond with:
 
-```markdown
-## Finding
+1. **Finding** — the likely concurrency performance, lifetime, isolation, or responsiveness issue.
+2. **Why it matters** — the impact on UI latency, throughput, memory, cancellation, actor contention, or correctness.
+3. **Evidence** — the code pattern, trace symptom, lifecycle mismatch, missing cancellation path, blocking call, actor hop pattern, or continuation/stream contract issue.
+4. **Recommended change** — the smallest safe change first; avoid broad rewrites unless the design itself causes the issue.
+5. **Trade-offs** — what the change improves and what it may complicate.
+6. **Validation** — how to verify the result with Instruments, signposts, cancellation tests, logs, memory tools, UI behavior, or production metrics.
 
-Describe the likely concurrency performance or lifecycle issue.
+When the task asks for an investigation plan, respond with:
 
-## Why it matters
+1. the symptom to reproduce;
+2. the suspected async boundary;
+3. the likely lifetime or isolation owner;
+4. the first trace or log to collect;
+5. the signal that would confirm or reject the hypothesis;
+6. the smallest next code area to inspect.
 
-Explain the impact on responsiveness, throughput, memory, cancellation, actor contention, or correctness.
+When the task asks for an explanation, keep it practical:
 
-## Evidence
-
-Point to the code pattern, trace symptom, missing cancellation path, actor hop pattern, or lifecycle mismatch.
-
-## Recommended change
-
-Give the smallest safe change first. Avoid broad rewrites unless the design itself causes the issue.
-
-## Validation
-
-Explain how to verify the result with Instruments, cancellation tests, logs, UI behavior, memory usage, or production metrics.
-```
-
-Prefer practical fixes over theoretical rewrites. Do not recommend actors, detached tasks, task groups, or `@concurrent` by default. Explain why the chosen primitive matches the lifetime, isolation, cancellation, and performance requirements.
+1. explain the model briefly;
+2. show one concrete iOS or Swift example only if needed;
+3. name the common misconception;
+4. include a validation or debugging technique.
+   ::: 
