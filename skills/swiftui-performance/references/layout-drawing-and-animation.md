@@ -2,19 +2,38 @@
 
 Use this reference when a SwiftUI task involves modifier chains, `GeometryReader`, `PreferenceKey`, layout feedback, shadows, masks, blurs, `Canvas`, `TimelineView`, animation hitches, Core Animation, or drawing-heavy UI.
 
-The goal is not to remove visual polish. The goal is to keep layout, drawing, and animation costs proportional to the UI surface, especially inside repeated or frequently updating content.
+The goal is not to remove visual polish. The goal is to keep layout, drawing, compositing, and animation costs proportional to the UI surface, especially inside repeated or frequently updating content.
 
-## Review Mindset
+## Contents
+
+- [Review mindset](#review-mindset)
+- [Modifier chains and view hierarchy](#modifier-chains-and-view-hierarchy)
+- [Conditional modifiers](#conditional-modifiers)
+- [GeometryReader](#geometryreader)
+- [PreferenceKey and layout feedback](#preferencekey-and-layout-feedback)
+- [Visual effects and compositing](#visual-effects-and-compositing)
+- [`drawingGroup()` and `compositingGroup()`](#drawinggroup-and-compositinggroup)
+- [`Canvas` for dense drawing](#canvas-for-dense-drawing)
+- [`TimelineView` for scheduled updates](#timelineview-for-scheduled-updates)
+- [Animation scope](#animation-scope)
+- [Layout-affecting vs compositor-friendly animation](#layout-affecting-vs-compositor-friendly-animation)
+- [Matched geometry and transitions](#matched-geometry-and-transitions)
+- [Validation](#validation)
+- [Common red flags](#common-red-flags)
+- [Preferred refactoring order](#preferred-refactoring-order)
+- [Agent output guidance](#agent-output-guidance)
+
+## Review mindset
 
 First classify the symptom or risk:
 
-- layout work: geometry reads, custom measurement, preference propagation, nested layouts
-- drawing work: many shapes, gradients, shadows, masks, blurs, charts, waveforms, decorative effects
-- animation work: broad animated state changes, repeated updates during animation, expensive layout-affecting transitions
-- compositing work: layered effects, clipping, transparency, materials, offscreen rendering candidates
-- unrelated app work: main-thread CPU work that merely appears during a visual interaction
+- layout work: geometry reads, custom measurement, preference propagation, nested layout, layout feedback loops;
+- drawing work: many shapes, gradients, charts, waveforms, decorative effects, custom drawing;
+- compositing work: shadows, masks, blurs, clipping, transparency, materials, layered effects;
+- animation work: broad animated state changes, layout-affecting transitions, repeated updates during animation;
+- unrelated app work: main-thread CPU, image decoding, formatting, or data preparation that overlaps a visual interaction.
 
-Do not assume every hitch is caused by SwiftUI diffing. For visible stutter, check whether the dominant cause is main-thread blocking, layout, drawing, compositing, state churn, image work, or animation scope.
+Do not assume every hitch is caused by SwiftUI diffing. Check whether the dominant cause is main-thread blocking, layout, drawing, compositing, state churn, image work, or animation scope.
 
 Prefer precise language:
 
@@ -22,104 +41,60 @@ Prefer precise language:
 This row performs a geometry read and applies a blur, mask, and shadow in repeated content. That may increase layout and compositing work during scrolling. Validate with Animation Hitches, Core Animation, Time Profiler, or the SwiftUI instrument if the issue is user-visible.
 ```
 
-Avoid unsupported claims:
+Avoid unsupported claims like “this blur causes a 30 ms frame” unless a trace, screen recording, metric, benchmark, or user-provided measurement supports it.
 
-```md
-This blur causes a 30 ms frame.
-```
-
-unless a trace, screen recording, metric, or benchmark shows it.
-
-## Modifier Chains and View Hierarchy
+## Modifier chains and view hierarchy
 
 Modifiers create additional view structure. Their order affects layout, drawing, hit testing, animation, and sometimes identity.
 
-In hot paths, review long modifier chains carefully, especially when they include:
+Review long modifier chains in hot paths, especially when they include:
 
-- `background`
-- `overlay`
-- `mask`
-- `clipShape`
-- `shadow`
-- `blur`
-- `drawingGroup`
-- `compositingGroup`
-- gestures
-- animations
-- geometry reads
-- preference keys
-- conditional wrappers
+- `background`, `overlay`, `mask`, `clipShape`, `shadow`, `blur`;
+- `drawingGroup`, `compositingGroup`;
+- gestures, animations, geometry reads, preference keys;
+- custom conditional wrappers.
 
 A long modifier chain is not automatically bad. It becomes suspicious when it is repeated many times, updates frequently, or hides layout/drawing work that should happen at a coarser boundary.
 
 Risky in a large list:
 
 ```swift
-struct PaymentRow: View {
-    let row: PaymentRowModel
-
-    var body: some View {
-        HStack {
-            Text(row.title)
-            Spacer()
-            Text(row.amountText)
-        }
-        .padding(16)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18)
-                .stroke(.white.opacity(0.3))
-        }
-        .shadow(radius: row.isHighlighted ? 12 : 4)
-        .blur(radius: row.isLocked ? 1.5 : 0)
-        .animation(.easeInOut, value: row.isHighlighted)
-    }
-}
+HStack { rowContent }
+    .padding(16)
+    .background(.ultraThinMaterial)
+    .clipShape(RoundedRectangle(cornerRadius: 18))
+    .overlay { RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.3)) }
+    .shadow(radius: row.isHighlighted ? 12 : 4)
+    .blur(radius: row.isLocked ? 1.5 : 0)
+    .animation(.easeInOut, value: row.isHighlighted)
 ```
 
-Prefer moving expensive decoration to a stable or coarser boundary when the visual design allows it:
+Prefer a simpler hot-path row when the design allows it:
 
 ```swift
-struct PaymentRow: View {
-    let row: PaymentRowModel
-
-    var body: some View {
-        HStack {
-            Text(row.title)
-            Spacer()
-            Text(row.amountText)
-        }
-        .padding(16)
-        .background(rowBackground)
-    }
-
-    private var rowBackground: some View {
+HStack { rowContent }
+    .padding(16)
+    .background {
         RoundedRectangle(cornerRadius: 18)
             .fill(row.isHighlighted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
     }
-}
 ```
 
-If the visual effect is essential, keep it. The agent should suggest validating the cost rather than deleting design details blindly.
+If the visual effect is essential, keep it and validate the cost instead of deleting design details blindly.
 
-## Conditional Modifiers
+## Conditional modifiers
 
 Be careful with helper APIs that wrap views conditionally in repeated or frequently updating content.
 
 Risky:
 
 ```swift
-metricLabel
-    .applyIf(row.isWarning) { view in
-        view
-            .padding(6)
-            .background(.orange.opacity(0.2))
-            .clipShape(Capsule())
-    }
+metricLabel.applyIf(row.isWarning) { view in
+    view.padding(6).background(.orange.opacity(0.2)).clipShape(Capsule())
+}
 ```
 
-This can make the structure differ between states. That may be fine for genuinely different UI, but it is unnecessary for simple visual value changes.
+This can make structure differ between states. That may be fine for genuinely different UI, but it is unnecessary for simple visual value changes.
 
 Prefer value-based modifiers when the view remains conceptually the same:
 
@@ -130,79 +105,58 @@ metricLabel
     .clipShape(Capsule())
 ```
 
-Use structural branching when the UI really has different structure, different children, or a different lifecycle.
+Use structural branching when the UI really has different children, different lifecycle, or meaningfully different layout.
 
 ## GeometryReader
 
 `GeometryReader` is useful when a view genuinely needs container size, coordinate space, or measured geometry. It is not inherently wrong.
 
-Use it carefully because geometry reads can couple layout to state updates and can make a repeated subtree more sensitive to size changes.
+Use it carefully because geometry reads can couple layout to state updates and make a repeated subtree sensitive to size changes.
 
 Common risks:
 
-- placing a geometry reader inside every row of a long list
-- storing frequently changing geometry values in broad observable state
-- using geometry to drive layout that standard SwiftUI layout can express directly
-- creating layout feedback loops where measurement changes state, which changes layout, which changes measurement
-- using geometry as a generic workaround instead of narrowing the layout problem
+- placing a geometry reader inside every row of a long list;
+- storing frequently changing geometry values in broad observable state;
+- using geometry to drive layout that standard SwiftUI layout can express directly;
+- creating feedback loops where measurement changes state, which changes layout, which changes measurement;
+- using geometry as a generic workaround instead of narrowing the layout problem.
 
 Risky in repeated content:
 
 ```swift
 List(cards) { card in
     GeometryReader { proxy in
-        LoyaltyCardRow(
-            card: card,
-            availableWidth: proxy.size.width
-        )
+        LoyaltyCardRow(card: card, availableWidth: proxy.size.width)
     }
 }
 ```
 
-Prefer reading geometry at a stable container boundary when every row needs the same container value:
+Prefer reading geometry at a stable container boundary when every row needs the same value:
 
 ```swift
-struct LoyaltyCardList: View {
-    let cards: [LoyaltyCardModel]
-
-    var body: some View {
-        GeometryReader { proxy in
-            let availableWidth = proxy.size.width
-
-            List(cards) { card in
-                LoyaltyCardRow(
-                    card: card,
-                    availableWidth: availableWidth
-                )
-            }
-        }
+GeometryReader { proxy in
+    List(cards) { card in
+        LoyaltyCardRow(card: card, availableWidth: proxy.size.width)
     }
 }
 ```
 
-Even better, prefer layout APIs that avoid explicit geometry when possible:
+Even better, use layout APIs that avoid explicit geometry when possible:
 
 ```swift
 LoyaltyCardRow(card: card)
     .frame(maxWidth: .infinity, alignment: .leading)
 ```
 
-For complex reusable layout logic, consider a custom `Layout` instead of scattering `GeometryReader` and preference keys across many views. Respect the app's deployment target before recommending this.
+For complex reusable layout logic, consider a custom `Layout` instead of scattering `GeometryReader` and preference keys across many views. Respect the deployment target before recommending this.
 
-## PreferenceKey and Layout Feedback
+## PreferenceKey and layout feedback
 
 Preference keys are useful for child-to-parent communication, such as reporting measured size, anchor positions, scroll-related values, or header offsets.
 
 They can also introduce extra update cycles because child layout produces a value, the parent reacts, and that reaction may cause another layout pass.
 
-Use them carefully in:
-
-- large lists
-- nested scroll views
-- animated containers
-- headers that resize while scrolling
-- rows that update often
-- layouts where the measured value is written back into state
+Use them carefully in large lists, nested scroll views, animated containers, resizing headers, rows that update often, and layouts where measured values are written back into state.
 
 Risky:
 
@@ -221,66 +175,30 @@ Prefer guarding state updates so tiny measurement changes do not trigger unneces
 }
 ```
 
-Example preference key:
-
-```swift
-private struct HeaderHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-```
-
-Example measurement:
-
-```swift
-HeaderView()
-    .background {
-        GeometryReader { proxy in
-            Color.clear.preference(
-                key: HeaderHeightKey.self,
-                value: proxy.size.height
-            )
-        }
-    }
-```
-
 Agent guidance:
 
 - Keep preference values small and stable.
 - Reduce values intentionally.
-- Avoid emitting per-row preferences when only a container-level value is needed.
+- Avoid emitting per-row preferences when a container-level value is enough.
 - Do not write preference results into broad shared models unless multiple independent views truly need them.
 - Guard against oscillation and tiny floating-point changes.
 
-## Shadows, Masks, Blurs, Materials, and Clipping
+## Visual effects and compositing
 
 Visual effects can increase drawing and compositing work, especially when repeated, animated, or combined.
 
-Review repeated content for:
-
-- large dynamic shadows
-- animated shadow radius or opacity
-- nested masks
-- repeated `blur`
-- translucent materials in many rows
-- clipping plus shadows
-- complex overlays and backgrounds
-- animated gradients
-- large images with masks or rounded clipping
+Review repeated content for large dynamic shadows, animated shadow radius or opacity, nested masks, repeated `blur`, translucent materials in many rows, clipping plus shadows, complex overlays/backgrounds, animated gradients, and large images with masks or rounded clipping.
 
 Do not state that every shadow, blur, or mask is slow. The risk depends on size, frequency, device, content, and animation.
 
 Prefer:
 
-- applying expensive effects at a coarser container boundary when visually acceptable
-- keeping row effects simple in large lists
-- avoiding animated blur/shadow changes during scrolling
-- pre-rendering decorative assets when the effect is static and complex
-- using simpler shapes for repeated masks and clips
-- validating with Instruments when the effect is suspected to cause hitches
+- applying expensive effects at a coarser boundary when visually acceptable;
+- keeping row effects simple in large lists;
+- avoiding animated blur/shadow changes during scrolling;
+- pre-rendering decorative assets when the effect is static and complex;
+- using simpler shapes for repeated masks and clips;
+- validating with Instruments when the effect is suspected to cause hitches.
 
 Risky in repeated animated content:
 
@@ -292,14 +210,12 @@ AvatarView(user: user)
     .animation(.spring(), value: isActive)
 ```
 
-Prefer a simpler hot-path version when the same design intent can be preserved:
+A simpler hot-path candidate:
 
 ```swift
 AvatarView(user: user)
     .clipShape(Circle())
-    .overlay {
-        Circle().stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2)
-    }
+    .overlay { Circle().stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2) }
 ```
 
 Use visual simplification as a candidate refactor, not as a universal rule.
@@ -308,7 +224,7 @@ Use visual simplification as a candidate refactor, not as a universal rule.
 
 Use these modifiers deliberately.
 
-`compositingGroup()` changes how SwiftUI composites a subtree. `drawingGroup()` can rasterize a subtree into an offscreen representation, which may help some complex vector drawing cases but can also increase memory use, offscreen rendering, and texture work.
+`compositingGroup()` changes how SwiftUI composites a subtree. `drawingGroup()` can rasterize a subtree into an offscreen representation. This may help some complex vector drawing cases, but it can also increase memory use, offscreen rendering, and texture work.
 
 Do not recommend `drawingGroup()` as a generic performance fix.
 
@@ -323,32 +239,17 @@ Risky if applied mechanically to every row:
 
 ```swift
 ForEach(rows) { row in
-    TransactionRow(row: row)
-        .drawingGroup()
+    TransactionRow(row: row).drawingGroup()
 }
 ```
 
-Agent guidance:
+Validate before and after because these modifiers can move cost rather than remove cost. Watch memory and animation behavior, not only CPU samples.
 
-- Use only when the subtree is visually complex enough to justify testing it.
-- Avoid for normal text, controls, and simple row layout.
-- Validate before and after because it can move cost rather than remove cost.
-- Watch memory and animation behavior, not only CPU samples.
-
-## Canvas for Dense Drawing
+## `Canvas` for dense drawing
 
 Use `Canvas` when the UI represents many small visual elements that update together and do not need to be individual SwiftUI subviews.
 
-Good candidates:
-
-- sparklines
-- mini charts
-- timelines
-- heat maps
-- audio waveforms
-- dense decorative particles
-- compact financial graphs
-- custom progress shapes
+Good candidates include sparklines, mini charts, timelines, heat maps, audio waveforms, dense particles, compact financial graphs, and custom progress shapes.
 
 Risky approach:
 
@@ -364,79 +265,42 @@ HStack(spacing: 1) {
 Prefer drawing dense primitives in one surface:
 
 ```swift
-struct MiniVolumeChart: View {
-    let samples: [Double]
+Canvas { context, size in
+    let barWidth = size.width / CGFloat(samples.count)
 
-    var body: some View {
-        Canvas { context, size in
-            guard !samples.isEmpty else { return }
-
-            let barWidth = size.width / CGFloat(samples.count)
-
-            for index in samples.indices {
-                let normalized = min(max(samples[index], 0), 1)
-                let height = size.height * CGFloat(normalized)
-                let rect = CGRect(
-                    x: CGFloat(index) * barWidth,
-                    y: size.height - height,
-                    width: max(1, barWidth - 1),
-                    height: height
-                )
-
-                context.fill(Path(rect), with: .color(.primary))
-            }
-        }
-        .frame(height: 44)
+    for index in samples.indices {
+        let height = size.height * CGFloat(min(max(samples[index], 0), 1))
+        let rect = CGRect(x: CGFloat(index) * barWidth, y: size.height - height, width: max(1, barWidth - 1), height: height)
+        context.fill(Path(rect), with: .color(.primary))
     }
 }
+.frame(height: 44)
 ```
 
-Keep the renderer lightweight. Prepare normalized points, colors, and labels outside the drawing closure when they are expensive to compute.
+Keep the renderer lightweight. Prepare normalized points, colors, labels, and expensive geometry outside the drawing closure.
 
 Do not replace normal interactive UI controls with `Canvas`. Individual elements drawn inside a canvas are not automatically separate SwiftUI views with their own accessibility, hit testing, focus, or state lifecycle.
 
-## TimelineView for Scheduled Updates
+## `TimelineView` for scheduled updates
 
-Use `TimelineView` when UI should redraw on a known schedule.
-
-Good candidates:
-
-- clocks
-- countdowns
-- market session timers
-- live progress indicators
-- time-based visualizations
-- animated drawings paired with `Canvas`
+Use `TimelineView` when UI should redraw on a known schedule, such as clocks, countdowns, market session timers, live progress indicators, time-based visualizations, or animated drawings paired with `Canvas`.
 
 Prefer scheduled redraws over manually driving repeated `@State` changes with `Timer` when the UI is naturally time-based.
 
 Example:
 
 ```swift
-struct AuctionCountdownView: View {
-    let endDate: Date
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            Text(remainingText(now: context.date))
-                .monospacedDigit()
-        }
-    }
-
-    private func remainingText(now: Date) -> String {
-        let seconds = max(0, Int(endDate.timeIntervalSince(now)))
-        return "\(seconds)s"
-    }
+TimelineView(.periodic(from: .now, by: 1)) { context in
+    Text(remainingText(now: context.date))
+        .monospacedDigit()
 }
 ```
 
-Do not use a high-frequency schedule when a slower cadence is enough.
-
-Risky:
+Do not use a high-frequency schedule when a slower cadence is enough:
 
 ```swift
 TimelineView(.periodic(from: .now, by: 1.0 / 60.0)) { context in
-    CountdownText(endDate: endDate, now: context.date)
+    Text(expensiveFormattedText(for: context.date))
 }
 ```
 
@@ -447,20 +311,12 @@ Agent guidance:
 - Match the schedule to the visible precision.
 - Avoid expensive formatting or data transformation inside every tick.
 - Do not use `TimelineView` as a replacement for async loading or event subscriptions.
-- For watchOS or reduced update environments, account for lower update cadence when relevant.
 
-## Animation Scope
+## Animation scope
 
 Animation hitches often come from too much work happening during an animated transaction.
 
-Review:
-
-- what state changes are animated
-- how broad the affected subtree is
-- whether the animation changes layout, drawing, or only transform/opacity
-- whether repeated rows update during the animation
-- whether expensive effects are animated
-- whether high-frequency values are stored in broad state or environment
+Review what state changes are animated, how broad the affected subtree is, whether the animation changes layout/drawing or only transform/opacity, whether rows update during the animation, whether expensive effects are animated, and whether high-frequency values live in broad state or environment.
 
 Prefer narrow animation scope:
 
@@ -472,56 +328,41 @@ withAnimation(.easeInOut) {
 
 and make sure only the relevant subtree depends on `expandedTransactionID`.
 
-Avoid applying broad implicit animation to a large container when many unrelated values change:
+Avoid applying broad implicit animation to a large container when many unrelated values can change:
 
 ```swift
 PortfolioScreen(model: model)
     .animation(.easeInOut, value: model)
 ```
 
-Prefer animating specific values:
+Prefer animating specific values and moving animation closer to the component that visually changes.
 
-```swift
-HoldingsSection(
-    rows: model.rows,
-    expandedID: model.expandedID
-)
-.animation(.easeInOut, value: model.expandedID)
-```
-
-Even this can be too broad if `HoldingsSection` is large. Consider moving the animation closer to the row or component that visually changes.
-
-## Layout-Affecting vs Compositor-Friendly Animation
+## Layout-affecting vs compositor-friendly animation
 
 Animations that change layout can be more expensive than animations that affect transform or opacity.
 
 Potentially heavier:
 
-- animating text size
-- animating dynamic content height across many rows
-- animating layout constraints through state changes
-- animating blur, mask, shadow, or gradient changes
-- expanding many rows at once
+- animating text size;
+- animating dynamic content height across many rows;
+- animating layout constraints through state changes;
+- animating blur, mask, shadow, or gradient changes;
+- expanding many rows at once.
 
 Often cheaper:
 
-- opacity
-- scale
-- translation
-- simple rotation
+- opacity;
+- scale;
+- translation;
+- simple rotation.
 
 Do not force every design into transform-only animation. Use this distinction to reason about risk and decide what to measure.
 
-## Matched Geometry and Transitions
+## Matched geometry and transitions
 
 `matchedGeometryEffect` and custom transitions can produce polished UI, but they can also make layout and animation dependencies harder to reason about.
 
-Use them carefully when:
-
-- source and destination views live inside large, frequently updating containers
-- list rows are inserted or removed during the same animation
-- the matched views have heavy masks, materials, shadows, or dynamic text
-- multiple matched elements animate at once
+Use them carefully when source and destination views live inside large, frequently updating containers; list rows are inserted or removed during the same animation; matched views have heavy masks/materials/shadows/dynamic text; or multiple matched elements animate at once.
 
 Agent guidance:
 
@@ -530,42 +371,23 @@ Agent guidance:
 - Validate on target devices if the transition is central to the experience.
 - If the animation hitches, test a simpler transition before redesigning the entire screen.
 
-## Animation Hitches and Core Animation Validation
+## Validation
 
-Use Animation Hitches, Core Animation, Time Profiler, and the SwiftUI instrument based on the question being asked.
+Choose the smallest tool that answers the question.
 
-Use Animation Hitches when the symptom is:
+Use Animation Hitches for scrolling stutter, skipped frames, visible gesture pauses, or janky transitions.
 
-- stutter during scrolling
-- skipped frames during animation
-- visible pauses during gestures
-- jank during transitions
+Use Core Animation-oriented inspection for too many layers/effects, expensive compositing, repeated offscreen rendering candidates, heavy masks/shadows/blurs/transparency, or large animated surfaces.
 
-Use Core Animation-oriented inspection when the suspicion is:
+Use Time Profiler for main-thread CPU work, expensive formatting or image work during updates, custom layout/drawing code consuming CPU, or synchronous work that overlaps animation.
 
-- too many layers or effects
-- expensive compositing
-- repeated offscreen rendering candidates
-- heavy masks, shadows, blurs, or transparency
-- large animated surfaces
+Use the SwiftUI instrument when available for long body updates, unnecessary body updates, broad SwiftUI update causes, or representable update cost.
 
-Use Time Profiler when the suspicion is:
-
-- main-thread CPU work
-- expensive formatting or image work during updates
-- custom layout or drawing code consuming CPU
-- synchronous work that overlaps animation
-
-Use the SwiftUI instrument when available and the suspicion is:
-
-- long view body updates
-- unnecessary body updates
-- broad SwiftUI update causes
-- representable update cost
+Use signposts around animation start/end, geometry or preference updates, page append or row insertion, render model generation, expensive drawing preparation, and state changes that trigger visual updates.
 
 Do not claim that Instruments proved a cause unless the trace or user-provided artifact actually shows it.
 
-## Common Red Flags
+## Common red flags
 
 Flag these patterns during layout, drawing, and animation review:
 
@@ -604,9 +426,7 @@ in a frequently scrolling list.
 
 ```swift
 ForEach(points.indices, id: \.self) { index in
-    Circle()
-        .frame(width: 2, height: 2)
-        .position(points[index])
+    Circle().frame(width: 2, height: 2).position(points[index])
 }
 ```
 
@@ -620,32 +440,32 @@ TimelineView(.periodic(from: .now, by: 1.0 / 60.0)) { context in
 
 when the visible content does not require 60 updates per second.
 
-## Preferred Refactoring Order
+## Preferred refactoring order
 
 For layout, drawing, and animation issues, prefer this order:
 
-1. Narrow the state dependency that triggers the visual update.
-2. Remove expensive data preparation from the visual update path.
-3. Simplify repeated row modifier chains.
-4. Move geometry reads to stable container boundaries.
-5. Replace layout feedback loops with simpler layout APIs when possible.
-6. Guard preference-driven state updates.
-7. Apply expensive effects at coarser boundaries when visually acceptable.
-8. Replace dense subview trees with `Canvas` when the content is drawing-like.
-9. Match `TimelineView` cadence to visible precision.
-10. Narrow animation scope to the component that actually changes.
-11. Prefer transform/opacity animation when it preserves the design intent.
-12. Validate suspected hitches with the smallest suitable profiling tool.
+1. 1Narrow the state dependency that triggers the visual update.
+2. 2Remove expensive data preparation from the visual update path.
+3. 3Simplify repeated row modifier chains.
+4. 4Move geometry reads to stable container boundaries.
+5. 5Replace layout feedback loops with simpler layout APIs when possible.
+6. 6Guard preference-driven state updates.
+7. 7Apply expensive effects at coarser boundaries when visually acceptable.
+8. 8Replace dense subview trees with `Canvas` when the content is drawing-like.
+9. 9Match `TimelineView` cadence to visible precision.
+10. 10Narrow animation scope to the component that actually changes.
+11. 11Prefer transform/opacity animation when it preserves the design intent.
+12. 12Validate suspected hitches with the smallest suitable profiling tool.
 
-## Agent Output Guidance
+## Agent output guidance
 
 When responding to a code review involving this reference, include:
 
-1. The likely layout, drawing, or animation risk.
-2. Why it matters in SwiftUI.
-3. Whether the issue is a static risk or measured finding.
-4. A focused refactor.
-5. What to measure if the user needs confirmation.
+1. 1The likely layout, drawing, or animation risk.
+2. 2Why it matters in SwiftUI.
+3. 3Whether the issue is a static risk or measured finding.
+4. 4A focused refactor.
+5. 5What to measure if the user needs confirmation.
 
 Avoid generic advice such as:
 
