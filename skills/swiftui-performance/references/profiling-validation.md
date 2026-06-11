@@ -1,29 +1,60 @@
-# Profiling and Validation Reference
+# Profiling and Validation
 
-Use this reference when the user asks for SwiftUI profiling help or provides performance artifacts such as Instruments traces, `xctrace` output, signpost logs, XCTest benchmark results, MetricKit payloads, screen recordings, memory graphs, console logs, or screenshots.
+Use this reference when the task asks for SwiftUI profiling help or provides performance artifacts such as Instruments traces, `xctrace` output, signpost logs, XCTest benchmark results, MetricKit payloads, screen recordings, memory graphs, console logs, or screenshots.
 
-This reference is a validation layer for the main SwiftUI performance skill. It should not replace code review. Use profiling to confirm or reject a specific hypothesis, not to produce generic advice.
+This is a validation reference for `swiftui-performance`. Use it to confirm or reject a specific SwiftUI performance hypothesis. Do not use it as a replacement for code review, and do not turn every SwiftUI task into a profiling session.
 
-## Core Rule
+## Contents
 
-Do not claim that a performance issue was measured unless the task includes actual evidence:
+- [Core rule](#core-rule)
+- [Evidence levels](#evidence-levels)
+- [Capability check](#capability-check)
+- [Define the scenario](#define-the-scenario)
+- [Build and runtime rules](#build-and-runtime-rules)
+- [Tool selection](#tool-selection)
+- [SwiftUI instrument](#swiftui-instrument)
+- [Time Profiler](#time-profiler)
+- [Hangs, hitches, and Core Animation](#hangs-hitches-and-core-animation)
+- [Allocations](#allocations)
+- [Memory graphs and leaks](#memory-graphs-and-leaks)
+- [Signposts](#signposts)
+- [Temporary SwiftUI debug probes](#temporary-swiftui-debug-probes)
+- [`xctrace` command-line workflow](#xctrace-command-line-workflow)
+- [XCTest performance tests](#xctest-performance-tests)
+- [MetricKit](#metrickit)
+- [Production signals](#production-signals)
+- [Screen recordings](#screen-recordings)
+- [Interpreting user-provided artifacts](#interpreting-user-provided-artifacts)
+- [Before/after validation](#beforeafter-validation)
+- [Map findings back to SwiftUI refactors](#map-findings-back-to-swiftui-refactors)
+- [Response formats](#response-formats)
+- [Common mistakes](#common-mistakes)
+- [Final principle](#final-principle)
 
-- an Instruments trace
-- `xctrace` output
-- signpost intervals
-- XCTest performance output
-- MetricKit payloads
-- a memory graph
-- a screen recording
-- user-provided timing logs
-- a command the agent actually ran
+## Core rule
+
+Do not claim that a performance issue was measured unless the task includes actual evidence.
+
+Evidence can come from:
+
+- an Instruments trace;
+- `xctrace` output;
+- signpost intervals;
+- XCTest performance output;
+- MetricKit payloads;
+- a memory graph;
+- a screen recording;
+- user-provided timing logs;
+- a profiling command the agent actually ran.
 
 If evidence is missing, phrase findings as risks or hypotheses.
 
 Prefer:
 
 ```md
-This is a likely hot path because the row formats values during `body`. To confirm it, profile the scroll interaction with the SwiftUI instrument or Time Profiler and look for long body updates or formatter samples on the main thread.
+This is a likely hot path because the row formats values during `body`.
+To confirm it, profile the scroll interaction with the SwiftUI instrument or Time Profiler
+and look for long body updates or formatter samples on the main thread.
 ```
 
 Avoid:
@@ -32,47 +63,29 @@ Avoid:
 This causes a 200 ms hitch.
 ```
 
-unless the artifact or command output actually shows that number.
+unless the artifact, benchmark, signpost interval, or command output actually shows that number.
 
-## What the Agent Can Do
+## Evidence levels
 
-When the environment supports it, the agent may:
+Keep evidence labels explicit.
 
-- inspect the project structure
-- identify the app target and scheme
-- run build commands
-- list simulators and devices
-- run `xcrun xctrace` commands
-- create trace files
-- export trace metadata or tables
-- run XCTest performance tests
-- parse text logs, signpost exports, MetricKit JSON, and benchmark output
-- compare before/after results
 
-When the environment does not support local profiling, the agent should:
+Do not promote a static risk into a measured result.
 
-- provide exact local steps for the user
-- suggest instrumentation code
-- request or describe the most useful artifact to export
-- explain what to look for in Instruments
-- keep findings clearly labeled as hypotheses
+## Capability check
 
-Do not pretend that GUI Instruments was used if no trace was opened or no artifact was provided.
+Before attempting local profiling, check whether the task has:
 
-## Capability Check Before Running Profiling
-
-Before attempting profiling, check whether the task has:
-
-- macOS host
-- full Xcode installation, not only Command Line Tools
-- selected Xcode path
-- buildable project
-- runnable target
-- known scheme/configuration
-- available simulator or device
-- reproducible scenario
-- permission to run shell commands
-- permission to create trace/log artifacts
+- macOS host;
+- full Xcode installation, not only Command Line Tools;
+- selected Xcode path;
+- buildable project;
+- runnable app target;
+- known scheme and configuration;
+- available simulator or device;
+- reproducible scenario;
+- permission to run shell commands;
+- permission to create trace or log artifacts.
 
 Useful checks:
 
@@ -84,102 +97,93 @@ xcrun xctrace list templates
 xcrun xctrace list devices
 ```
 
-If any of these fail, do not force profiling. Provide a local plan instead.
+If any required capability is missing, do not force profiling. Provide local steps for the user and keep findings labeled as hypotheses.
 
-## First Step: Define the Scenario
+Do not pretend that GUI Instruments was used if no trace was opened or no artifact was provided.
+
+## Define the scenario
 
 Every profiling task needs a reproducible scenario.
 
 Capture:
 
-- target screen
-- start state
-- exact user action
-- expected symptom
-- device or simulator
-- OS version
-- build configuration
-- data size
-- network/cache state
-- number of repetitions
+- target screen;
+- start state;
+- exact user action;
+- expected symptom;
+- device or simulator;
+- OS version;
+- build configuration;
+- data size;
+- network and cache state;
+- number of repetitions.
 
-Examples:
+Good scenarios:
 
 ```md
-Scenario: Open Portfolio, scroll the holdings list from top to bottom, tap Load More once, then continue scrolling for 10 seconds.
+Open Portfolio, scroll the holdings list from top to bottom, tap Load More once,
+then continue scrolling for 10 seconds.
 ```
 
 ```md
-Scenario: Cold-launch the app after termination, wait until the first account balance is visible, then stop measurement.
+Type five characters into search with 2,000 local rows loaded and observe whether rows update on every keystroke.
 ```
 
 ```md
-Scenario: Type five characters into search with 2,000 local rows loaded and observe whether rows update on every keystroke.
+Open the detail screen, start the chart animation, then switch tabs twice while the animation is running.
 ```
 
-Avoid measuring vague interactions such as “the app feels slow.” Convert them into a concrete scenario first.
+Avoid measuring vague interactions such as “the app feels slow.” Convert them into a concrete action first.
 
-## Build and Runtime Rules
+## Build and runtime rules
 
-Prefer release-like conditions for performance validation:
+Prefer release-like conditions for validation:
 
-- Release configuration when possible
-- same device class for before/after comparisons
-- same OS version
-- same account/data set
-- same network conditions
-- same app state before each run
-- multiple runs for noisy metrics
+- Release configuration when possible;
+- same device class for before/after comparisons;
+- same OS version;
+- same account or data set;
+- same network and cache state;
+- same app state before each run;
+- multiple runs for noisy metrics.
 
-Debug builds can be useful for diagnosis, logging, and `_printChanges()`, but they are not reliable proof of production performance.
+Debug builds are useful for diagnosis, logging, and `_printChanges()`, but they are not reliable proof of production performance.
 
 Simulator results are useful for quick iteration and code-path discovery. Prefer physical devices for final conclusions about scrolling smoothness, animation hitches, launch time, thermal behavior, and memory pressure.
 
 Low Power Mode can be used as a manual stress signal, not as a formal benchmark.
 
-## Tool Selection
+## Tool selection
 
 Choose the smallest tool that can answer the question.
 
-| Symptom or question | Prefer | Look for |
-|---|---|---|
-| Slow SwiftUI updates | SwiftUI instrument when available | long body updates, unnecessary updates, update groups |
-| CPU spike during interaction | Time Profiler | main-thread samples, app symbols, expensive transformations |
-| Animation hitch or scroll jank | Hangs/Hitches, Animation Hitches, Core Animation, Time Profiler | missed frames, commit/render cost, layout/drawing work |
-| Main-thread stalls | Time Profiler, Hangs, signposts | long main-thread work, blocking calls |
-| Repeated allocations or memory churn | Allocations | temporary objects, repeated formatter/string/model creation |
-| Memory growth or retention | Memory Graph, Leaks, Allocations | retained view models, cycles, caches, large graphs |
-| Launch regression | XCTest `XCTApplicationLaunchMetric`, Instruments, MetricKit | first frame, responsiveness, launch phases |
-| Production trend | MetricKit, Xcode Organizer, app telemetry | hangs, launch, memory, CPU, energy, animation responsiveness |
-| Local algorithmic cost | XCTest performance test | sorting, filtering, grouping, formatting, render model generation |
-| User-visible symptom only | Screen recording plus profiling plan | visible hitch timing, reproduction steps |
 
-Do not assume every frame drop is caused by SwiftUI diffing. Rendering, layout, image decoding, main-thread blocking, GPU work, and UIKit/AppKit bridges can all be involved.
+Do not assume every dropped frame is caused by SwiftUI diffing. Rendering, layout, image decoding, main-thread blocking, GPU work, and UIKit/AppKit bridges can all be involved.
 
-## SwiftUI Instrument
+## SwiftUI instrument
 
 Use the SwiftUI instrument when available in the installed Instruments/Xcode version.
 
 It is useful for:
 
-- long view body updates
-- unnecessary updates
-- frequent update groups
-- expensive representable updates
-- correlating state changes with SwiftUI work
-- checking whether a dependency-narrowing refactor reduced update work
+- long view body updates;
+- unnecessary updates;
+- frequent update groups;
+- expensive representable updates;
+- correlating state changes with SwiftUI work;
+- checking whether dependency narrowing reduced update work.
 
 Inspect:
 
-- views with long `body` updates
-- views updating after unrelated state changes
-- update groups around the target interaction
-- repeated row updates during scrolling or pagination
-- representable updates if the screen embeds UIKit/AppKit components
+- views with long `body` updates;
+- views updating after unrelated state changes;
+- update groups around the target interaction;
+- repeated row updates during scrolling or pagination;
+- representable updates if the screen embeds UIKit/AppKit components.
 
-Use it with Time Profiler when possible. The SwiftUI instrument can point to the problematic update region; Time Profiler helps identify which app code consumed CPU during that region.
+Use it with Time Profiler when possible. The SwiftUI instrument can identify the problematic update region; Time Profiler helps identify which app code consumed CPU during that region.
 
-Do not rely on the SwiftUI instrument being available in every environment. If the template is missing, empty, or unsupported for the current Xcode/device combination, fall back to Time Profiler, Hangs/Hitches, signposts, and targeted debug probes.
+If the SwiftUI template is missing, unsupported, or empty, fall back to Time Profiler, Hangs/Hitches, signposts, and temporary debug probes.
 
 ## Time Profiler
 
@@ -187,25 +191,31 @@ Use Time Profiler to answer:
 
 - Is the main thread blocked?
 - Which interaction creates the CPU spike?
-- Which app symbols dominate the sampled time?
+- Which app symbols dominate sampled time?
 - Is `body` indirectly calling expensive app code?
 - Are formatters, sorters, mappers, decoders, or computed properties visible in the hot path?
 - Is pagination append rebuilding old render data?
-- Are row builders or view initializers expensive?
+- Are row builders, view initializers, or representable updates expensive?
 
 Prioritize app-specific symbols over framework noise.
 
 Common SwiftUI findings:
 
-- sorting inside `body`
-- filtering inside repeated content
-- date or currency formatting per row
-- formatter allocation during view updates
-- image decoding or resizing on the main thread
-- building large render model arrays during rendering
-- broad computed properties read by views
-- excessive per-row action/menu construction
-- expensive UIKit/AppKit representable updates
+- sorting inside `body`;
+- filtering inside repeated content;
+- date or currency formatting per row;
+- formatter allocation during view updates;
+- image decoding or resizing on the main thread;
+- building large render model arrays during rendering;
+- broad computed properties read by views;
+- excessive per-row action/menu construction;
+- expensive UIKit/AppKit representable updates.
+
+Useful Call Tree settings:
+
+- **Separate by Thread** — distinguish main-thread render work from background preparation.
+- **Invert Call Tree** — surface leaf functions and app code more quickly.
+- **Hide System Libraries** — reduce framework noise when searching for app symbols.
 
 Interpretation rule:
 
@@ -213,21 +223,21 @@ Interpretation rule:
 - A large amount of SwiftUI framework time is context, not automatically the root cause.
 - Look for app code that triggers expensive updates or makes SwiftUI reconcile too much work.
 
-## Hangs, Hitches, Animation Hitches, and Core Animation
+## Hangs, hitches, and Core Animation
 
-Use these tools when the symptom is visible stutter, delayed gestures, paused animations, scroll jank, or missed frames.
+Use Hangs, Animation Hitches, Core Animation, or Time Profiler when the symptom is visible stutter, delayed gestures, paused animations, scroll jank, or missed frames.
 
 Check whether the hitch aligns with:
 
-- main-thread blocking work
-- too much layout work
-- expensive drawing
-- image decoding or conversion
-- deep or frequently rebuilt view/layer hierarchies
-- heavy shadows, masks, blurs, overlays, or visual effects
-- repeated state changes during animation
-- list updates during scrolling
-- large transaction/commit phases
+- main-thread blocking work;
+- too much layout work;
+- expensive drawing;
+- image decoding or conversion;
+- deep or frequently rebuilt view/layer hierarchies;
+- heavy shadows, masks, blurs, overlays, or visual effects;
+- repeated state changes during animation;
+- list updates during scrolling;
+- large transaction or commit phases.
 
 For commit-phase hitches, inspect layout, display, prepare, and commit-related work. Heavy view hierarchy mutations, redundant layout invalidation, image preparation, and deep hierarchies can all contribute.
 
@@ -239,38 +249,32 @@ Use Allocations when the symptom suggests memory churn, repeated construction, o
 
 Look for:
 
-- repeated formatter creation
-- repeated string creation in rows
-- rebuilding large arrays of render models
-- temporary collection churn from sorting/filtering/grouping
-- image decoding or resizing
-- repeated `AnyView` or wrapper construction in hot paths
-- copy-on-write structures copied during rendering
-- per-row closure-heavy helper objects
+- repeated formatter creation;
+- repeated string creation in rows;
+- rebuilding large arrays of render models;
+- temporary collection churn from sorting, filtering, or grouping;
+- image decoding or resizing;
+- repeated `AnyView` or wrapper construction in hot paths;
+- copy-on-write structures copied during rendering;
+- per-row closure-heavy helper objects.
 
-Correlate allocation spikes with signposts or user interactions. Allocation volume alone is not enough; tie it to a symptom such as hitching, CPU spikes, memory pressure, or regression.
+Correlate allocation spikes with signposts or user interactions. Allocation volume alone is not enough; tie it to hitching, CPU spikes, memory pressure, or a regression.
 
-## Memory Graphs and Leaks
+## Memory graphs and leaks
 
 Use memory graphs when the issue is growth, retention, or suspected leaks.
 
 For SwiftUI screens, inspect:
 
-- view models retained after navigation away
-- tasks retaining models after cancellation should have happened
-- closures capturing models, services, or parent views unexpectedly
-- long-lived publishers, notifications, or async streams
-- caches without eviction
-- UIKit/AppKit representables retaining coordinators or delegates
-- image caches retaining decoded images too aggressively
+- view models retained after navigation away;
+- tasks retaining models after cancellation should have happened;
+- closures capturing models, services, or parent views unexpectedly;
+- long-lived publishers, notifications, or async streams;
+- caches without eviction;
+- UIKit/AppKit representables retaining coordinators or delegates;
+- image caches retaining decoded images too aggressively.
 
-Do not call every retained object a leak. Distinguish:
-
-- expected lifetime
-- cache retention
-- delayed release
-- retain cycle
-- unbounded growth
+Do not call every retained object a leak. Distinguish expected lifetime, cache retention, delayed release, retain cycle, and unbounded growth.
 
 If the user provides only a memory graph screenshot, state what it proves visually and what requires full graph inspection.
 
@@ -280,16 +284,16 @@ Use signposts to mark app-level phases and align them with profiler timelines.
 
 Good boundaries:
 
-- user action started
-- network response received
-- render models built
-- page appended to state
-- filter applied
-- sort applied
-- search text processed
-- animation started
-- expensive cache lookup started/finished
-- image preparation started/finished
+- user action started;
+- network response received;
+- render models built;
+- page appended to state;
+- filter applied;
+- sort applied;
+- search text processed;
+- animation started;
+- expensive cache lookup started/finished;
+- image preparation started/finished.
 
 Example:
 
@@ -331,11 +335,11 @@ func applySearch(_ query: String) async {
 
 Avoid logging sensitive values in signpost messages.
 
-## Temporary SwiftUI Debug Probes
+## Temporary SwiftUI debug probes
 
 Use debug probes only for local diagnosis.
 
-Useful probes:
+Useful probe:
 
 ```swift
 var body: some View {
@@ -347,18 +351,18 @@ var body: some View {
 
 `_printChanges()` is an underscored diagnostic helper. Use it only as a temporary local debugging probe, preferably under `#if DEBUG`. Do not treat it as production API.
 
-Other probes:
+Other temporary probes:
 
-- count row body invocations
-- log render model rebuilds
-- log filtering/sorting duration
-- log duplicate `.onAppear` pagination triggers
-- log page append counts
-- log task cancellation/restart events
+- count row body invocations;
+- log render model rebuilds;
+- log filtering/sorting duration;
+- log duplicate `.onAppear` pagination triggers;
+- log page append counts;
+- log task cancellation/restart events.
 
 Remove debug probes before production.
 
-## `xctrace` Command-Line Workflow
+## `xctrace` command-line workflow
 
 Use `xctrace` for repeatable command-line profiling when GUI Instruments automation is not necessary.
 
@@ -390,16 +394,6 @@ xcrun xctrace record \
   --attach <pid-or-process-name>
 ```
 
-Record by launching a target binary when applicable:
-
-```bash
-xcrun xctrace record \
-  --template 'Time Profiler' \
-  --time-limit 30s \
-  --output /tmp/SwiftUIPerf.trace \
-  --launch -- /path/to/AppOrTool
-```
-
 Open the trace manually if GUI inspection is needed:
 
 ```bash
@@ -414,7 +408,7 @@ xcrun xctrace export \
   --toc
 ```
 
-Then export specific tables using the schema/path shown in the table of contents. Do not hardcode export paths across Xcode versions; inspect the `--toc` output first.
+Then export specific tables using the schema or path shown in the table of contents. Do not hardcode export paths across Xcode versions; inspect the `--toc` output first.
 
 Use:
 
@@ -425,22 +419,22 @@ xcrun xctrace help export
 
 when exact command syntax is uncertain.
 
-## XCTest Performance Tests
+## XCTest performance tests
 
 Use XCTest performance tests for repeatable local benchmarks of isolated app code.
 
 Good candidates:
 
-- render model generation
-- filtering
-- sorting
-- grouping
-- formatting pipelines
-- pagination state updates
-- cache lookups
-- pure data transformations
-- launch metrics with `XCTApplicationLaunchMetric`
-- UI hitch measurements with XCTest metrics when supported by the project/toolchain
+- render model generation;
+- filtering;
+- sorting;
+- grouping;
+- formatting pipelines;
+- pagination state updates;
+- cache lookups;
+- pure data transformations;
+- launch metrics with `XCTApplicationLaunchMetric`;
+- UI hitch measurements with XCTest metrics when supported by the project/toolchain.
 
 Example for pure work:
 
@@ -470,28 +464,20 @@ final class LaunchPerformanceTests: XCTestCase {
 
 Use XCTest metrics to guard regressions in CI, but do not treat microbenchmarks as complete proof of UI smoothness. They isolate code costs; Instruments and real interactions are still needed for frame-time and rendering issues.
 
-When comparing results:
-
-- run the same test multiple times
-- avoid changing data sets between runs
-- watch variance
-- compare Release-like builds when possible
-- keep baselines per device class when results are device-dependent
-
 ## MetricKit
 
 Use MetricKit for production-level performance signals.
 
 MetricKit can help prioritize investigation by showing trends in areas such as:
 
-- app launch time
-- hangs
-- responsiveness
-- memory
-- CPU
-- disk writes
-- energy
-- crash diagnostics
+- app launch time;
+- hangs;
+- responsiveness;
+- memory;
+- CPU;
+- disk writes;
+- energy;
+- crash diagnostics.
 
 MetricKit is not a replacement for local profiling. It usually tells the agent where to investigate, not exactly which SwiftUI line to change.
 
@@ -528,96 +514,96 @@ final class MetricsSubscriber: NSObject, MXMetricManagerSubscriber {
 
 Do not block launch or the main thread while processing payloads. Serialize and upload later if necessary.
 
-## Xcode Organizer and Production Monitoring
+## Production signals
 
-Use Organizer or production monitoring dashboards to identify patterns before deep local profiling.
+Use Xcode Organizer or production monitoring dashboards to identify patterns before deep local profiling.
 
 Check:
 
-- app version where regression started
-- device families affected
-- OS versions affected
-- launch type or launch phase if available
-- hang rate trends
-- memory pressure trends
-- animation responsiveness trends
-- whether the issue is isolated to a feature rollout
+- app version where regression started;
+- device families affected;
+- OS versions affected;
+- launch type or launch phase if available;
+- hang rate trends;
+- memory pressure trends;
+- animation responsiveness trends;
+- whether the issue is isolated to a feature rollout.
 
 Use production signals to choose the local scenario to reproduce.
 
 Do not use aggregate production metrics as the only proof that a specific code refactor fixed the issue. Confirm with before/after local measurements when possible, then watch production trends after release.
 
-## Screen Recordings
+## Screen recordings
 
 A screen recording is useful evidence for user-visible symptoms, but it rarely proves root cause.
 
 From a screen recording, the agent may infer:
 
-- where the symptom occurs
-- whether it is during scrolling, navigation, typing, loading, or animation
-- whether the issue looks like hitching, delayed input, blank content, repeated loading, or layout instability
-- which scenario to profile
+- where the symptom occurs;
+- whether it is during scrolling, navigation, typing, loading, or animation;
+- whether the issue looks like hitching, delayed input, blank content, repeated loading, or layout instability;
+- which scenario to profile.
 
 Do not infer exact frame time, CPU cost, memory pressure, or SwiftUI invalidation cause from a recording alone.
 
 Use the recording to create a profiling scenario.
 
-## Interpreting User-Provided Artifacts
+## Interpreting user-provided artifacts
 
 When the user provides artifacts, analyze them directly and state what they prove.
 
 For Instruments screenshots:
 
-- identify selected time range
-- identify selected instrument/lane
-- read visible call tree entries
-- distinguish app code from framework code
-- ask for or suggest exporting the selected call tree if details are missing
+- identify selected time range;
+- identify selected instrument or lane;
+- read visible call tree entries;
+- distinguish app code from framework code;
+- ask for or suggest exporting the selected call tree if details are missing.
 
 For `.trace` files:
 
-- try to inspect/export with `xctrace` if available
-- if unavailable, provide local export steps
-- prefer focused exports over huge raw dumps
+- try to inspect or export with `xctrace` if available;
+- if unavailable, provide local export steps;
+- prefer focused exports over huge raw dumps.
 
 For signpost logs:
 
-- group intervals by operation
-- compare min/median/max if multiple runs exist
-- align intervals with user actions
-- look for variance and outliers
+- group intervals by operation;
+- compare min, median, and max if multiple runs exist;
+- align intervals with user actions;
+- look for variance and outliers.
 
 For XCTest output:
 
-- identify metric type
-- compare baseline/current values
-- check standard deviation or variance if available
-- avoid overreacting to one noisy run
+- identify metric type;
+- compare baseline and current values;
+- check standard deviation or variance if available;
+- avoid overreacting to one noisy run.
 
 For MetricKit JSON:
 
-- identify payload type
-- inspect app version, device/OS dimensions if present
-- distinguish metric payloads from diagnostic payloads
-- look for repeated patterns rather than single isolated events
+- identify payload type;
+- inspect app version, device, and OS dimensions if present;
+- distinguish metric payloads from diagnostic payloads;
+- look for repeated patterns rather than single isolated events.
 
 For memory graphs:
 
-- identify retained roots and ownership paths
-- distinguish expected retention from cycles
-- check whether navigation away should have released the object
+- identify retained roots and ownership paths;
+- distinguish expected retention from cycles;
+- check whether navigation away should have released the object.
 
-## Before/After Validation
+## Before/after validation
 
 A good validation loop:
 
-1. Define one scenario.
-2. Capture baseline.
-3. Form one hypothesis.
-4. Apply one targeted refactor.
-5. Re-run the same scenario.
-6. Compare the same metrics.
-7. Keep or revert the change based on evidence.
+1. 1Define one scenario.
+2. 2Capture baseline.
+3. 3Form one hypothesis.
+4. 4Apply one targeted refactor.
+5. 5Re-run the same scenario.
+6. 6Compare the same metrics.
+7. 7Keep or revert the change based on evidence.
 
 Avoid changing many variables at once.
 
@@ -639,64 +625,52 @@ For before/after reports, include:
 ## Remaining risks
 ```
 
-## Mapping Findings Back to SwiftUI Refactors
+## Map findings back to SwiftUI refactors
 
 Use profiling results to choose targeted fixes.
 
-| Evidence | Likely refactor |
-|---|---|
-| Long body updates with formatter samples | precompute formatted strings or cache formatter output |
-| Many unrelated views update | narrow dependencies, split dependency islands, avoid broad model reads |
-| Row updates during pagination append | preserve row identity, avoid rebuilding old rows, consider page/section boundaries |
-| CPU spike in sorting/filtering | move transformation outside `body`, debounce search, cache derived data |
-| Allocation spike on scroll | remove per-row allocation, formatter creation, type erasure, temporary arrays |
-| Hitches during animation | reduce main-thread work, simplify layout/drawing, avoid state bursts during animation |
-| Memory graph retains model after navigation | inspect tasks, closures, subscriptions, delegates, caches |
-| Launch metric regression | inspect startup work, lazy initialization, synchronous I/O, main actor startup tasks |
-| MetricKit hang trend | reproduce affected scenario locally, inspect main-thread stalls and hang diagnostics |
 
-## Response Format for Profiling Help
+## Response formats
 
 When the user asks for profiling help, answer with:
 
-1. Reproducible scenario
-2. Hypothesis
-3. Tool choice
-4. Exact command or local steps when possible
-5. What to look for
-6. How to interpret findings
-7. Refactor candidates
-8. How to compare before and after
-
-## Response Format for Artifact Analysis
+1. 1Reproducible scenario.
+2. 2Hypothesis.
+3. 3Tool choice.
+4. 4Exact command or local steps when possible.
+5. 5What to look for.
+6. 6How to interpret findings.
+7. 7Refactor candidates.
+8. 8How to compare before and after.
 
 When the user provides profiling artifacts, answer with:
 
-1. What the artifact shows
-2. What is measured vs inferred
-3. Most likely bottleneck
-4. Supporting evidence from the artifact
-5. What remains uncertain
-6. Suggested refactor or next diagnostic step
-7. Validation plan
+1. 1What the artifact shows.
+2. 2What is measured vs inferred.
+3. 3Most likely bottleneck.
+4. 4Supporting evidence from the artifact.
+5. 5What remains uncertain.
+6. 6Suggested refactor or next diagnostic step.
+7. 7Validation plan.
 
-## Common Mistakes
+## Common mistakes
 
 Avoid these mistakes:
 
-- profiling a vague scenario
-- comparing Debug before with Release after
-- using simulator-only results as final proof of device smoothness
-- claiming SwiftUI diffing is the cause without trace evidence
-- treating MetricKit as a local profiler
-- treating screen recordings as CPU evidence
-- treating `_printChanges()` output as production measurement
-- adding signposts but forgetting to align them with profiler timelines
-- reading only framework symbols and ignoring app code
-- optimizing a microbenchmark while the real issue is layout, rendering, or scheduling
-- changing architecture before confirming the hot path
+- profiling a vague scenario;
+- comparing Debug before with Release after;
+- using simulator-only results as final proof of device smoothness;
+- claiming SwiftUI diffing is the cause without trace evidence;
+- treating MetricKit as a local profiler;
+- treating screen recordings as CPU evidence;
+- treating `_printChanges()` output as production measurement;
+- adding signposts but forgetting to align them with profiler timelines;
+- reading only framework symbols and ignoring app code;
+- optimizing a microbenchmark while the real issue is layout, rendering, or scheduling;
+- changing architecture before confirming the hot path;
+- claiming numeric savings without a measured before/after comparison.
 
-## Final Principle
+## Final principle
 
 Profiling should make a SwiftUI hypothesis falsifiable.
 
