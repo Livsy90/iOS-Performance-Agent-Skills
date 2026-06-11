@@ -1,462 +1,166 @@
 ---
-
 name: ios-perceived-performance
-description: Use this skill when reviewing iOS screens, user flows, loading states, perceived latency, time to first feedback, progressive rendering, skeleton views, placeholders, optimistic updates, rollback behavior, high-stakes actions, interaction feedback, UI continuity, responsiveness validation, or product-level performance trade-offs.
-
+description: Use this skill for product-level iOS responsiveness and loading/feedback flows, including perceived latency, time to first feedback, progressive rendering, loading states, skeletons, placeholders, optimistic updates, rollback behavior, high-stakes actions, UI continuity, and responsiveness validation. Do not use it for low-level CPU, memory, rendering, Swift Concurrency, or launch-performance diagnostics unless the task is about user-perceived speed.
 ---
 
 # iOS Perceived Performance
 
-Use this skill to review whether an iOS feature feels responsive to users, even when raw execution time does not change.
+## Purpose
 
-This skill is not a low-level profiling guide. It is not focused on CPU samples, allocations, ARC traffic, Swift Concurrency internals, or rendering diagnostics. Use it when the task is about user-perceived speed, feedback, loading behavior, optimistic UI, progressive content, or validation of responsiveness from a product perspective.
+Use this skill to review whether an iOS screen or flow feels responsive to users, even when raw execution time does not change.
 
-## Core Principle
+This skill focuses on user-visible feedback, loading behavior, staged content, continuity, optimistic UI, high-stakes actions, and validation of perceived responsiveness.
 
-Performance is not only how long work takes. It is also how the interface communicates progress, responds to actions, and keeps the user oriented while work is happening.
+## When to use this skill
 
-Users do not see CPU usage, network traces, or database timings. They notice:
+Use this skill when the task involves:
 
-* whether anything happens after they tap
-* when meaningful content first appears
-* when they can start interacting
-* whether updates feel continuous or jumpy
-* whether loading states are clear
-* whether timing is predictable
-* whether the app feels stuck, empty, or inconsistent
+- a screen that feels slow, stuck, blank, jumpy, or unresponsive;
+- no visible feedback after a tap or gesture;
+- delayed first meaningful content;
+- loading states, placeholders, skeletons, empty states, retry states, or refresh states;
+- progressive rendering, partial content, section-level loading, or stale-while-refreshing UI;
+- optimistic updates, pending state, rollback, retries, or local/server reconciliation;
+- high-stakes, irreversible, destructive, financial, legal, medical, identity, or security-sensitive actions;
+- duplicate submissions or repeated taps during async work;
+- perceived latency trade-offs where the product behavior matters as much as the raw duration;
+- validation using recordings, UI tests, Instruments, MetricKit, production logs, or user-visible signals.
 
-Start by asking what delay the user actually experiences.
+## When not to use this skill
 
-## Agent Capability Boundaries
+Do not use this skill for:
+
+- low-level CPU, allocation, ARC, memory, runtime, or compiler-performance investigations;
+- SwiftUI invalidation, identity, layout, or scrolling problems unless the question is about perceived responsiveness;
+- Swift Concurrency internals unless task behavior affects visible UI feedback or staged loading;
+- app launch performance unless the question is about first useful screen or first interaction from the user's point of view;
+- visual redesign requests with no responsiveness, loading, or feedback concern;
+- claims that require running the app when no runtime evidence is available.
+
+Use `ios-performance-profiling`, `swiftui-performance`, `swift-concurrency-performance`, `swift-runtime-performance`, or `ios-launch-performance` when those domains are the primary problem.
+
+## Core model
+
+Users do not experience CPU samples, network traces, database timings, or async task graphs directly.
+
+They experience:
+
+- whether the app reacts immediately;
+- when useful content first appears;
+- whether progress is clear;
+- whether the screen stays stable while work continues;
+- whether failures and retries are understandable;
+- whether pending work feels trustworthy;
+- whether actions can be repeated accidentally;
+- whether the UI tells the truth about the server-authoritative outcome.
+
+Start with the user-visible delay or uncertainty before proposing lower-level optimization.
+
+## Agent capability boundaries
 
 The agent can usually inspect and improve:
 
-* state models for loading, loaded, empty, error, refreshing, pending, and failed states
-* whether UI updates happen only after the whole operation completes
-* whether a user action has immediate visual feedback
-* whether optimistic updates have rollback and pending states
-* whether high-stakes actions wait for server confirmation
-* whether duplicate submissions are prevented
-* whether stale content can remain visible during refresh
-* whether code structure allows progressive rendering
-
-The agent can suggest, but cannot directly prove without runtime evidence:
-
-* whether a screen feels fast enough
-* whether a skeleton improves perception
-* whether a deliberate delay is appropriate
-* whether Low Power Mode exposes frame drops
-* whether older devices perform acceptably
-* whether a product flow feels trustworthy to users
-
-Do not claim that a manual or device-based validation step was performed unless the user provided evidence such as a recording, trace, test result, or profiling output.
-
-## References
-
-Read these only when the task requires deeper guidance:
-
-* `references/progressive-rendering.md` — staged loading, critical content first, partial UI updates, stale-while-refreshing screens, section-level loading, and avoiding all-or-nothing rendering.
-* `references/loading-states.md` — placeholders, skeleton views, empty states, progress indicators, loading copy, and transitions between loading, loaded, empty, and error states.
-* `references/optimistic-updates.md` — optimistic UI, pending state, rollback strategy, conflict handling, retries, local reconciliation, and failure recovery.
-* `references/high-stakes-actions.md` — financial, legal, destructive, irreversible, or trust-sensitive actions where optimistic UI may be unsafe.
-* `references/validation-and-testing.md` — older-device testing, Low Power Mode as a manual stress signal, release builds, scrolling tests, animation tests, screen recordings, Instruments, and production responsiveness signals.
-
-## Review Workflow
-
-When reviewing a screen or flow, classify the perceived performance problem first:
-
-1. Is there no feedback after a user action?
-2. Does the screen stay blank while data loads?
-3. Does the UI wait for all data before showing anything?
-4. Can critical content appear earlier?
-5. Does refresh remove useful existing content?
-6. Are loading, empty, error, and retry states distinct?
-7. Can the action be updated optimistically?
-8. Is optimistic UI unsafe because the action is high-stakes?
-9. Is the interaction vulnerable to duplicate submission?
-10. Is the perceived delay caused by inconsistent timing or abrupt updates?
-11. Is validation possible from code alone, or only by running the app?
-
-Prefer product-level improvements before low-level optimization when the user-visible issue is lack of feedback, blank UI, or poor state communication.
-
-## Time to First Feedback
-
-After a user action, the interface should acknowledge that something started.
-
-Look for actions that do this:
-
-```swift
-func submit() async throws {
-    let result = try await service.submit()
-    state = .finished(result)
-}
-```
-
-The user may see no immediate response until the request completes.
-
-Prefer an explicit intermediate state:
-
-```swift
-func submit() async {
-    state = .submitting
-
-    do {
-        let result = try await service.submit()
-        state = .finished(result)
-    } catch {
-        state = .failed(error)
-    }
-}
-```
-
-The agent can usually implement this when the state model and UI code are available.
-
-Review questions:
-
-* Does the UI change immediately after the user action?
-* Is the tapped control disabled or marked as in progress?
-* Is there a visible loading, pending, or progress state?
-* Can duplicate submissions happen during the request?
-* Does failure return the interface to a usable state?
-
-## Progressive Rendering
-
-Avoid all-or-nothing rendering when a screen can display useful content in stages.
-
-Risky:
-
-```swift
-func loadScreen() async throws {
-    state = .loading
-
-    async let profile = api.loadProfile()
-    async let recommendations = api.loadRecommendations()
-    async let history = api.loadHistory()
-
-    state = .loaded(
-        try await ScreenData(
-            profile: profile,
-            recommendations: recommendations,
-            history: history
-        )
-    )
-}
-```
-
-This may delay the entire screen until every section is ready.
-
-Consider section-level state when content has different importance or latency:
-
-```swift
-struct ScreenState {
-    var profile: SectionState<Profile>
-    var recommendations: SectionState<[Recommendation]>
-    var history: SectionState<[HistoryItem]>
-}
-```
-
-Then the UI can show primary content first and fill secondary content later.
-
-Agent action:
-
-* If the screen currently waits for all data, suggest staged loading.
-* If code is available, propose a state model that supports partial content.
-* If product requirements are unclear, do not assume every section should load independently.
-* If ordering matters, consistency matters, or partial content would confuse users, prefer an explicit loading state.
-
-For detailed staged-loading patterns, read `references/progressive-rendering.md`.
-
-## Loading States, Skeletons, and Placeholders
-
-Use loading states to reduce uncertainty. A blank or static screen can look broken even if work is happening.
-
-Prefer distinct states:
-
-```swift
-enum ContentState<Value> {
-    case idle
-    case loading
-    case loaded(Value)
-    case empty
-    case failed(Error)
-}
-```
-
-For refresh flows, consider preserving existing content:
-
-```swift
-enum FeedState {
-    case loading
-    case loaded(items: [FeedItem], isRefreshing: Bool)
-    case empty
-    case failed(Error)
-}
-```
-
-This lets the UI keep useful content visible while showing that refresh is in progress.
-
-Skeleton views and placeholders are useful when they show structure before content arrives. They are less useful when they hide errors, create layout shifts, or remain on screen without progress.
-
-Agent action:
-
-* Can suggest skeletons or placeholders when a screen is blank during load.
-* Can add loading states when the code has a clear state model.
-* Should not claim that skeletons reduce actual execution time.
-* Should not recommend skeletons when simple cached content, inline progress, or immediate partial content would be clearer.
-
-For deeper loading-state guidance, read `references/loading-states.md`.
-
-## Continuity and Predictability
-
-A screen can feel slow when updates happen in abrupt jumps, even if total loading time is acceptable.
-
-Watch for:
-
-* clearing the screen during every refresh
-* replacing all rows when only a small part changed
-* jumping from blank state to dense content
-* multiple unrelated spinners
-* inconsistent loading behavior across repeated attempts
-* controls that sometimes react instantly and sometimes do nothing
-* layout shifts caused by late-arriving content
-
-Prefer stable transitions:
-
-* keep old content visible during refresh when safe
-* mark sections as refreshing instead of clearing them
-* preserve scroll position when possible
-* avoid unnecessary layout shifts
-* update rows or sections incrementally
-* show consistent pending and failure states
-
-Agent action:
-
-* Can identify state transitions that clear useful content.
-* Can suggest preserving existing data during refresh.
-* Can recommend stable placeholders with fixed dimensions.
-* Can suggest validation with screen recording or UI tests when perceived continuity cannot be proven from code.
-
-## Optimistic Updates
-
-Optimistic updates improve perceived latency by updating the UI before backend confirmation when the result is predictable and reversible.
-
-Good candidates:
-
-* mute or unmute a topic
-* save or unsave an item
-* mark as read
-* dismiss a local tip
-* update a local preference
-* edit a draft
-* reorder local content before sync
-
-Risky candidates:
-
-* payments
-* transfers
-* irreversible deletion
-* legal consent
-* medical or identity-related actions
-* actions with complex server-side validation
-* actions with high failure or conflict probability
-
-Example pattern:
-
-```swift
-func toggleTopicMute(id: Topic.ID) {
-    let previous = store.topic(id).isMuted
-    let next = !previous
-
-    store.updateTopic(id) { topic in
-        topic.isMuted = next
-        topic.syncState = .syncing
-    }
-
-    syncTask = Task {
-        do {
-            try await notificationAPI.setMuted(next, for: id)
-            store.updateTopic(id) { topic in
-                topic.syncState = .synced
-            }
-        } catch {
-            store.updateTopic(id) { topic in
-                topic.isMuted = previous
-                topic.syncState = .failed
-            }
-
-            errorPresenter.showSyncFailure()
-        }
-    }
-}
-```
-
-Review optimistic updates for:
-
-* previous value captured before mutation
-* pending/syncing state
-* rollback path
-* failure message
-* retry behavior
-* duplicate tap behavior
-* conflict handling
-* cancellation behavior
-* consistency with server state after app restart
-
-Agent action:
-
-* Can propose optimistic UI when action is low-risk and reversible.
-* Can implement rollback if code structure is available.
-* Should not recommend optimistic success for high-stakes or irreversible operations.
-* Should explicitly call out consistency trade-offs.
-
-For detailed optimistic update patterns, read `references/optimistic-updates.md`.
-
-## High-Stakes and Irreversible Actions
-
-Some operations should not look complete until the server confirms them.
-
-Use explicit progress and confirmation for:
-
-* financial transactions
-* destructive operations
-* irreversible account changes
-* legal consent
-* security-sensitive changes
-* server-authoritative decisions
-* actions where local prediction can mislead the user
-
-Prefer:
-
-* visible progress state
-* disabled repeated submission
-* idempotency or request tracking when applicable
-* clear success state only after confirmation
-* clear failure recovery
-* no optimistic final state before server acknowledgement
-
-Example:
-
-```swift
-func confirmTransfer() async {
-    state = .submitting
-    isSubmitDisabled = true
-
-    do {
-        let receipt = try await transferService.confirm()
-        state = .confirmed(receipt)
-    } catch {
-        state = .failed(error)
-        isSubmitDisabled = false
-    }
-}
-```
-
-Agent action:
-
-* Can identify unsafe optimistic UI.
-* Can suggest explicit progress and duplicate-submission prevention.
-* Should not suggest artificial trust-building delays as a default solution.
-* Should not hide uncertainty when the operation outcome depends on the server.
-
-For deeper high-stakes action guidance, read `references/high-stakes-actions.md`.
-
-## Deliberate Delays
-
-Deliberate delays are rarely a performance fix. Treat them as a product or trust-design decision, not a default optimization.
-
-They may be considered only when:
-
-* users expect visible processing
-* instant completion would look suspicious or untrustworthy
-* the operation is already complete but the flow requires acknowledgement
-* product/design has a clear reason
-* the delay is short, consistent, and tested
-
-Do not recommend deliberate delays to hide poor performance, mask backend uncertainty, or make an app feel artificially busy.
-
-Agent action:
-
-* Can mention deliberate delay as a product hypothesis in narrow cases.
-* Should not implement it unless explicitly requested or clearly required by the product flow.
-* Should prefer real progress, immediate feedback, or clear state transitions over artificial waiting.
-
-## Constrained Performance Validation
-
-The agent cannot enable Low Power Mode, run the app on a device, or prove responsiveness unless the environment provides that capability or the user supplies evidence.
-
-For render-heavy screens, suggest validation under constrained conditions:
-
-* real older devices when available
-* Low Power Mode as a cheap manual stress signal
-* release configuration, not only debug
-* long scrolling sessions
-* repeated navigation in and out of the screen
-* animation-heavy interactions
-* screen recordings to inspect first feedback and visual stability
-* Instruments for hangs, hitches, layout, rendering, and main-thread work
-
-Low Power Mode does not simulate an older device. It does not reproduce older memory bandwidth, GPU architecture, refresh behavior, OS version, or thermal state. Use it only as a signal that a screen may have low performance headroom.
-
-Agent action:
-
-* Can recommend Low Power Mode testing for render-heavy screens.
-* Must not claim Low Power Mode proves older-device performance.
-* Must not claim it performed the test.
-* Should explain what to observe: frame drops, delayed taps, animation hitches, image decoding, layout cost, compositing, transparency, or view invalidation.
-
-For detailed validation strategies, read `references/validation-and-testing.md`.
-
-## Evidence and Diagnostics
-
-Prefer evidence that reflects user experience.
-
-Useful evidence:
-
-* video or screen recording
-* tap-to-first-feedback timing
-* time to first meaningful content
-* time until interaction is possible
-* scroll hitch observations
-* animation hitch observations
-* Xcode Organizer hangs and hitches
-* Instruments traces
-* MetricKit responsiveness data
-* production logs around loading stages
-* UI tests that capture state transitions
-* user reports describing stuck, blank, or jumpy screens
-
-Map symptoms to likely causes:
-
-* blank screen → missing loading, placeholder, cached, or progressive state
-* delayed tap response → no immediate state update or main-thread work
-* everything appears at once after a long delay → all-or-nothing loading
-* jumpy content → unstable layout or late-arriving sections
-* repeated submission → missing pending state or disabled control
-* incorrect optimistic result → missing rollback or conflict handling
-* user distrust → unclear progress, premature success, or inconsistent timing
-
-## Code Review Checklist
-
-Before finalizing a recommendation, check:
-
-* [ ] Is the user-visible delay clearly identified?
-* [ ] Does the UI provide feedback immediately after user action?
-* [ ] Is the screen blank when it could show structure, cached content, or partial content?
-* [ ] Can critical content render before secondary content?
-* [ ] Are loading, empty, error, refreshing, pending, and failed states distinct?
-* [ ] Does refresh preserve useful existing content when safe?
-* [ ] Are transitions stable enough to avoid visual jumps?
-* [ ] Is optimistic UI appropriate for this action?
-* [ ] Is rollback implemented for optimistic updates?
-* [ ] Are pending and failed synchronization states visible?
-* [ ] Is optimistic UI avoided for high-stakes or irreversible actions?
-* [ ] Are duplicate submissions prevented?
-* [ ] Is deliberate delay avoided unless there is a clear product reason?
-* [ ] Does the recommendation distinguish what the agent can implement from what needs manual validation?
-* [ ] Is validation realistic: device testing, Low Power Mode signal, Instruments, screen recording, UI tests, or production metrics?
-* [ ] Does the answer avoid claiming unmeasured performance improvements?
-
-## Output Format
+- state models for loading, loaded, empty, error, refreshing, pending, syncing, and failed states;
+- whether UI changes happen only after async work completes;
+- whether user actions receive immediate visual feedback;
+- whether refresh clears useful existing content unnecessarily;
+- whether a screen can render critical content before secondary content;
+- whether optimistic updates have pending, rollback, retry, and conflict behavior;
+- whether high-stakes actions wait for confirmation before showing final success;
+- whether duplicate submissions are prevented.
+
+The agent can suggest, but cannot prove without runtime evidence:
+
+- whether a screen feels fast enough;
+- whether a skeleton improves perception;
+- whether a deliberate delay is appropriate;
+- whether Low Power Mode exposes low performance headroom;
+- whether older devices perform acceptably;
+- whether a product flow feels trustworthy to users.
+
+Do not claim that manual or device-based validation was performed unless the user supplied evidence such as a recording, trace, test result, profiling output, or production signal.
+
+## Review workflow
+
+1. Identify the user-visible symptom: no feedback, blank screen, all-or-nothing loading, jumpy update, unclear progress, unsafe optimism, repeated submission, or distrust.
+2. Locate the state transition that creates the symptom.
+3. Decide whether the first useful improvement is product/UI feedback or low-level performance work.
+4. Check whether the UI acknowledges user actions immediately.
+5. Check whether critical content can appear before secondary content.
+6. Check whether refresh can preserve useful existing content.
+7. Check whether loading, empty, error, retry, refreshing, pending, synced, and failed states are distinct enough.
+8. Decide whether optimistic UI is safe, reversible, and honest.
+9. For high-stakes actions, prefer explicit progress and server-confirmed success over optimistic final states.
+10. Propose the smallest change that improves user-visible responsiveness.
+11. State what can be determined from code and what needs runtime validation.
+12. Recommend validation using evidence that reflects user experience.
+
+## Decision rules
+
+- If the user sees no response after an action, add immediate feedback before optimizing the operation itself.
+- If the screen is blank while work is happening, consider cached content, placeholders, skeletons, or progressive rendering.
+- If the screen waits for unrelated data before showing anything, consider section-level loading or staged rendering.
+- If refresh removes useful content, preserve stale content when it is safe and mark it as refreshing.
+- If loading, empty, error, and retry states collapse into one state, separate them before tuning performance.
+- If an action is low-risk and reversible, optimistic UI may improve perceived latency.
+- If an action is financial, destructive, legal, medical, identity-related, security-sensitive, irreversible, or server-authoritative, do not show final success before confirmation.
+- If duplicate submissions are possible, add pending state, disabled controls, idempotency, or request tracking.
+- If a recommendation depends on product trust or user perception, describe it as a product hypothesis unless evidence exists.
+- If a performance claim cannot be proven from code, include a validation plan instead of claiming success.
+
+## Gotchas
+
+- Do not treat skeletons or placeholders as actual execution-time improvements.
+- Do not hide errors behind indefinite loading states.
+- Do not recommend optimistic success for high-stakes or irreversible actions.
+- Do not suggest artificial delays as a default performance fix.
+- Do not clear content during refresh unless stale content is unsafe or misleading.
+- Do not split every screen into independent loading sections if partial content would confuse the user.
+- Do not claim Low Power Mode simulates an older device. Use it only as a rough manual stress signal.
+- Do not say “this feels faster” without evidence from a recording, trace, metric, test, or user-visible behavior.
+- Do not make broad low-level optimization recommendations when the immediate problem is missing feedback or unclear state.
+
+## Evidence and validation
+
+Prefer evidence that reflects what the user experiences:
+
+- screen recording from action to first feedback and first meaningful content;
+- tap-to-first-feedback timing;
+- time to first meaningful content;
+- time until primary interaction becomes available;
+- repeated refresh attempts;
+- slow-network testing;
+- UI tests that capture state transitions;
+- Instruments traces for hangs, hitches, layout, rendering, and main-thread work;
+- MetricKit or Xcode Organizer responsiveness data;
+- production logs around loading stages;
+- user reports describing stuck, blank, jumpy, or misleading UI.
+
+Use careful language when evidence is incomplete:
+
+- “This should reduce blank-screen time.”
+- “This gives the user earlier feedback.”
+- “This needs validation on a release build.”
+- “Validate with a screen recording, Instruments trace, UI test, or production signal.”
+
+Avoid unsupported claims:
+
+- “This fixes performance.”
+- “This is now smooth.”
+- “This will feel faster to users.”
+- “This works well on older devices.”
+
+## Reference routing
+
+Read these only when relevant:
+
+- `references/progressive-rendering.md` — read when a screen waits for all data before showing useful UI, can show critical content first, needs section-level loading, or clears existing content during refresh.
+- `references/loading-states.md` — read when the task involves loading, empty, error, retry, refreshing, skeleton, placeholder, or progress states.
+- `references/optimistic-updates.md` — read when the task involves optimistic UI, pending state, rollback, retries, conflict handling, local reconciliation, or server sync.
+- `references/high-stakes-actions.md` — read when the action is financial, legal, destructive, irreversible, medical, identity-related, security-sensitive, or server-authoritative.
+- `references/validation-and-testing.md` — read when the task asks how to validate perceived responsiveness, older-device behavior, Low Power Mode signals, release-build behavior, screen recordings, Instruments traces, MetricKit, or production evidence.
+
+## Output expectations
 
 When reviewing a screen or flow, respond with:
 
@@ -467,23 +171,23 @@ Describe the perceived performance issue.
 
 ## User impact
 
-Explain what the user sees or feels: no feedback, blank screen, jumpy updates, delayed interaction, unclear progress, or premature success.
+Explain what the user sees or feels: no feedback, blank screen, jumpy updates, delayed interaction, unclear progress, unsafe optimism, duplicate submission risk, or premature success.
 
 ## Evidence
 
-Point to code, state model, flow behavior, trace, recording, or missing UI state.
+Point to code, state model, flow behavior, trace, recording, metric, user report, or missing UI state.
 
 ## Recommended change
 
-Suggest the smallest useful product/UI change first: feedback, loading state, progressive rendering, optimistic update, rollback, explicit confirmation, or validation.
+Suggest the smallest useful product/UI change first: immediate feedback, distinct loading state, progressive rendering, stale-while-refreshing content, optimistic update with rollback, explicit confirmation, duplicate-submission prevention, or validation.
 
 ## Implementation notes
 
-Explain what can be changed in code and what depends on product/design decisions.
+Explain what can be changed in code and what depends on product, design, backend, or runtime evidence.
 
 ## Validation
 
-State how to verify the improvement. Do not claim manual/device validation was performed unless evidence is provided.
+State how to verify the improvement. Do not claim manual, device, or production validation was performed unless evidence is provided.
 ```
 
-Prefer user-visible improvements over low-level optimization when the bottleneck is missing feedback, all-or-nothing rendering, unclear loading, or unsafe optimistic behavior.
+Prefer user-visible improvements over low-level optimization when the bottleneck is missing feedback, all-or-nothing rendering, unclear loading, unsafe optimistic behavior, or poor continuity.
