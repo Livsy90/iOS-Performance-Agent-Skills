@@ -1,38 +1,64 @@
 # Closures, Bindings, and Equatable Views
 
-Use this reference when reviewing SwiftUI code that involves stored closures in views, capture lists, action handlers, gestures, custom `Binding(get:set:)`, key-path bindings, `.equatable()`, or `Equatable` view inputs.
+Use this reference when a SwiftUI performance review involves stored closures in views, capture lists, action handlers, gestures, menus, swipe actions, custom `Binding(get:set:)`, key-path bindings, `.equatable()`, or `Equatable` view inputs.
 
-The goal is not to remove every closure or make every view equatable. The goal is to keep visual inputs, action routing, and equality boundaries easy to reason about, especially inside large or frequently updating view trees.
+The goal is not to remove every closure, avoid every custom binding, or make every view equatable. The goal is to keep visual inputs, action routing, and equality boundaries easy to reason about in large or frequently updating view trees.
 
-## Core Principle
+## Contents
 
-Separate visual data from non-visual behavior when a view is repeated many times or updated frequently.
+- Core model
+- Review procedure
+- Stored closures in repeated views
+- Capture lists and action inputs
+- Action routing patterns
+- Gestures, menus, and swipe actions
+- Custom bindings
+- Key-path bindings with Observation
+- Equatable views
+- Equatable and closures
+- Validation
+- Risk levels
+- Common mistakes
 
-A SwiftUI view value may contain both:
+## Core model
 
-- visual inputs, such as text, flags, numbers, colors, and render models
-- behavioral inputs, such as closures, gesture actions, menu actions, and custom binding closures
+A SwiftUI view value may contain two kinds of input:
 
-Visual inputs are usually easy to compare and reason about. Behavioral inputs are often harder to compare, easier to over-capture, and more likely to hide dependencies. This matters most in hot paths such as `List`, `LazyVStack`, complex rows, swipe actions, menus, and gesture-heavy components.
+- visual input: text, numbers, flags, colors, images, render models, layout values
+- behavioral input: closures, gesture handlers, menu actions, swipe actions, binding closures, service calls
 
-## Review Procedure
+Visual input is usually easier to compare, isolate, and test. Behavioral input is harder to compare, easier to over-capture, and more likely to hide dependencies.
+
+This matters most when the view is:
+
+- inside a large `List`, `LazyVStack`, or `ForEach`
+- updated frequently by parent state
+- gesture-heavy or menu-heavy
+- already suspected of unnecessary row updates
+- using `.equatable()` or custom equality
+- using custom `Binding(get:set:)` in repeated content
+
+Do not claim that closures automatically cause redraws. Treat closure-heavy rows as a review signal, not proof of a measured performance issue.
+
+## Review procedure
 
 When reviewing closure-heavy SwiftUI code, check:
 
-1. Is the closure part of a small static view or a hot repeated view?
-2. Is the closure stored as a property of a visual row?
-3. Does the closure capture the whole parent view implicitly?
-4. Does the closure capture a large domain value when only an ID is needed?
-5. Are multiple non-visual actions mixed into a row that otherwise has simple visual input?
-6. Would a key-path binding express the same state relationship more clearly?
-7. Is `.equatable()` used only for cheap, complete, visual equality?
-8. Could the refactor make update locality clearer without adding unnecessary architecture?
+1. 1Is this a small static view or a hot repeated view?
+2. 2Are closures stored as properties of a visual row?
+3. 3Does a closure capture the whole parent view implicitly?
+4. 4Does the action capture a full domain model when only an ID is needed?
+5. 5Are multiple non-visual actions mixed into otherwise simple visual row input?
+6. 6Would a key-path binding express the same editable state more clearly?
+7. 7Does a custom binding hide expensive derived reads or business rules?
+8. 8Is `.equatable()` used only for cheap, complete, visual equality?
+9. 9Would the refactor make update locality clearer without adding unnecessary architecture?
 
-Do not flag every closure. Closures are normal in SwiftUI. Focus on repeated views, broad captures, unstable behavior inputs, and cases where code structure makes updates harder to reason about.
+Focus on repeated views, broad captures, hidden work, and equality boundaries. Do not flag every closure in ordinary SwiftUI code.
 
-## Stored Closures in Repeated Views
+## Stored closures in repeated views
 
-A view that stores many closures can become harder to reason about because the row value contains non-visual behavior in addition to visual data.
+A row that stores many closures mixes visual data with non-visual behavior.
 
 Risky in a large or frequently updating collection:
 
@@ -45,13 +71,8 @@ struct PaymentRow: View {
 
     var body: some View {
         HStack {
-            VStack(alignment: .leading) {
-                Text(row.title)
-                Text(row.subtitle)
-            }
-
+            Text(row.title)
             Spacer()
-
             Text(row.amountText)
         }
         .contentShape(Rectangle())
@@ -70,41 +91,16 @@ And the parent creates new closures while building every row:
 ForEach(model.payments) { payment in
     PaymentRow(
         row: payment,
-        onOpen: {
-            model.openPayment(payment.id)
-        },
-        onRetry: {
-            model.retryPayment(payment.id)
-        },
-        onCancel: {
-            model.cancelPayment(payment.id)
-        }
+        onOpen: { model.openPayment(payment.id) },
+        onRetry: { model.retryPayment(payment.id) },
+        onCancel: { model.cancelPayment(payment.id) }
     )
 }
 ```
 
 This is not automatically wrong. It becomes suspicious when the collection is large, the parent updates often, rows are already expensive, or unnecessary row updates are suspected.
 
-Prefer keeping the visual row focused on visual input, and route actions at a stable boundary when practical:
-
-```swift
-struct PaymentRow: View {
-    let row: PaymentRowModel
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading) {
-                Text(row.title)
-                Text(row.subtitle)
-            }
-
-            Spacer()
-
-            Text(row.amountText)
-        }
-    }
-}
-```
+Prefer keeping the row focused on visual input, then attach interaction at a stable boundary when practical:
 
 ```swift
 ForEach(model.payments) { payment in
@@ -117,7 +113,6 @@ ForEach(model.payments) { payment in
             Button("Retry") { [model, id = payment.id] in
                 model.retryPayment(id)
             }
-
             Button("Cancel", role: .destructive) { [model, id = payment.id] in
                 model.cancelPayment(id)
             }
@@ -125,9 +120,9 @@ ForEach(model.payments) { payment in
 }
 ```
 
-This does not remove closures from the SwiftUI tree. The narrower goal is to keep the row's stored input visual, make row values easier to compare, and avoid accidentally capturing more state than the action needs.
+This does not remove closures from the SwiftUI tree. It keeps the row's stored input visual and makes captured dependencies explicit.
 
-## Capture Lists
+## Capture lists and action inputs
 
 Closures created inside `body` can accidentally capture the whole parent view value. In repeated content, prefer capture lists that make dependencies explicit and small.
 
@@ -172,35 +167,11 @@ Avoid capturing:
 - a broad handler container when a narrower dependency is available
 - values recomputed during every render
 
-Capture lists do not make closures automatically diffable. They reduce accidental captures and make action dependencies easier to audit.
+Passing the full model is fine when the action genuinely needs the full immutable value. Do not mechanically replace all values with IDs if that forces extra lookups or makes the code less correct.
 
-## Passing IDs Instead of Full Models
+## Action routing patterns
 
-For row actions, prefer passing a stable ID when the action only needs identity.
-
-Risky:
-
-```swift
-Button("Open") {
-    model.open(invoice)
-}
-```
-
-Prefer:
-
-```swift
-Button("Open") { [model, id = invoice.id] in
-    model.openInvoice(id)
-}
-```
-
-Passing the full model is fine when the action genuinely needs the full immutable value. Do not mechanically replace all values with IDs if doing so makes the code less correct or forces extra lookups.
-
-## Single Action Router Pattern
-
-When a child must report interactions to a parent, prefer a compact action surface over many independent closure properties.
-
-Useful for medium-complex components:
+When a child must report several interactions to a parent, a compact action surface can be clearer than many independent closure properties.
 
 ```swift
 enum CardAction {
@@ -208,32 +179,24 @@ enum CardAction {
     case favorite(Card.ID)
     case dismiss(Card.ID)
 }
-```
 
-```swift
 struct CardRow: View {
     let row: CardRowModel
     let send: (CardAction) -> Void
 
     var body: some View {
-        HStack {
-            Text(row.title)
-            Spacer()
-            Button("Favorite") {
-                send(.favorite(row.id))
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
+        Button(row.title) {
             send(.open(row.id))
         }
     }
 }
 ```
 
-This still stores a closure, so it is not a magic performance fix. It can reduce API noise and make behavior easier to inspect. For very hot rows, also consider whether actions can be attached outside the purely visual row.
+This still stores a closure. It is not a magic performance fix. Use this pattern when it reduces API noise, clarifies behavior, or prevents many separate stored closures from spreading through row APIs.
 
-## Gestures, Menus, and Swipe Actions
+For very hot rows, also consider whether actions can be attached outside the purely visual row.
+
+## Gestures, menus, and swipe actions
 
 Gestures, menus, context menus, and swipe actions are interaction surfaces. In large collections, treat them as part of row complexity.
 
@@ -242,9 +205,9 @@ Review whether:
 - every row really needs the interaction surface
 - actions capture only stable IDs or narrow dependencies
 - menu content is lightweight
-- destructive actions have clear confirmation or state handling
 - repeated action builders hide expensive work
 - gesture state is owned locally where possible
+- destructive actions have clear confirmation or state handling
 
 Risky:
 
@@ -259,18 +222,15 @@ FeedRow(row: row)
     }
 ```
 
-Prefer preparing lightweight action models outside the hot row builder when action computation is non-trivial:
+Prefer preparing lightweight action models before rendering when action computation is non-trivial:
 
 ```swift
 struct FeedRowModel: Identifiable, Equatable {
     let id: FeedItem.ID
     let title: String
-    let subtitle: String
     let availableActions: [FeedActionModel]
 }
-```
 
-```swift
 FeedRow(row: row)
     .contextMenu {
         ForEach(row.availableActions) { action in
@@ -283,7 +243,7 @@ FeedRow(row: row)
 
 Do not add indirection just because a row has one tap gesture. Apply this guidance when repeated interaction builders become heavy or hard to reason about.
 
-## Custom Bindings
+## Custom bindings
 
 Prefer key-path bindings when no transformation is needed.
 
@@ -305,7 +265,9 @@ Toggle(
 )
 ```
 
-A custom `Binding(get:set:)` is not automatically wrong. It often introduces fresh closures, broader captures, and hidden transformation logic inside rendering code. Use it when the binding really needs transformation, validation, optional handling, clamping, logging, or routing.
+A custom `Binding(get:set:)` is not automatically wrong. It often introduces fresh closures, broader captures, and hidden transformation logic inside rendering code.
+
+Use a custom binding when the binding genuinely needs transformation, validation, optional handling, clamping, logging, routing, or compatibility with an API shape.
 
 Valid use case:
 
@@ -314,9 +276,7 @@ TextField(
     "Limit",
     value: Binding(
         get: { draft.dailyLimit ?? 0 },
-        set: { newValue in
-            draft.dailyLimit = newValue == 0 ? nil : newValue
-        }
+        set: { draft.dailyLimit = $0 == 0 ? nil : $0 }
     ),
     format: .number
 )
@@ -324,7 +284,7 @@ TextField(
 
 When custom binding logic grows, move the behavior to a named helper or model method so the view does not hide business rules inside `body`.
 
-## Key-Path Bindings with Observation
+## Key-path bindings with Observation
 
 For Observation-based models, prefer `@Bindable` when a view needs editable bindings into an `@Observable` model.
 
@@ -334,24 +294,20 @@ final class NotificationSettings {
     var pushEnabled = false
     var weeklySummaryEnabled = true
 }
-```
 
-```swift
 struct NotificationSettingsForm: View {
     @Bindable var settings: NotificationSettings
 
     var body: some View {
-        Form {
-            Toggle("Push", isOn: $settings.pushEnabled)
-            Toggle("Weekly summary", isOn: $settings.weeklySummaryEnabled)
-        }
+        Toggle("Push", isOn: $settings.pushEnabled)
+        Toggle("Weekly summary", isOn: $settings.weeklySummaryEnabled)
     }
 }
 ```
 
 This keeps the binding relationship explicit and avoids replacing simple key-path access with custom closure bindings.
 
-## Binding Red Flags
+## Binding red flags
 
 Flag these patterns in performance-sensitive SwiftUI code:
 
@@ -378,7 +334,7 @@ Binding(
 
 The issue is not the `Binding` type itself. The issue is hidden work, broad captures, index-based mutation risk, or transformation logic running on a hot rendering path.
 
-## Equatable Views
+## Equatable views
 
 Use `Equatable` only when a view has clear, cheap, visual inputs and its body is expensive enough to justify the equality check.
 
@@ -397,7 +353,7 @@ struct RateBadge: View, Equatable {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack {
             Text(currencyCode)
             Text(valueText)
             DirectionIcon(direction: direction)
@@ -406,93 +362,31 @@ struct RateBadge: View, Equatable {
 }
 ```
 
-```swift
-RateBadge(
-    currencyCode: row.currencyCode,
-    valueText: row.rateText,
-    direction: row.direction
-)
-.equatable()
-```
-
-Do not use `.equatable()` as a bandage for broad invalidation. First try to narrow dependencies, stabilize identity, and remove expensive work from `body`.
-
-## Equatable Input Rules
+Use `.equatable()` only when equality covers all visible inputs and is cheaper than recomputing the body.
 
 Include in equality:
 
 - all visual values that affect rendering
 - style flags that change visible output
-- values that change layout, text, color, images, accessibility labels, or visibility
+- values that affect layout, text, color, images, accessibility labels, visibility, or animation state
 
 Avoid including:
 
 - non-visual closures
 - services
-- model objects whose internal changes are not represented by the compared values
+- model objects whose internal changes are not represented by compared values
 - large arrays when equality is more expensive than recomputing the view
 - volatile values that change every update
 
 Do not exclude a value from equality if changing it should visibly update the view.
 
-Risky:
-
-```swift
-struct AccountSummaryCard: View, Equatable {
-    let title: String
-    let balanceText: String
-    let isLoading: Bool
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.title == rhs.title &&
-        lhs.balanceText == rhs.balanceText
-        // isLoading is missing even though it affects visible UI.
-    }
-
-    var body: some View {
-        VStack {
-            Text(title)
-            Text(balanceText)
-
-            if isLoading {
-                ProgressView()
-            }
-        }
-    }
-}
-```
-
-Prefer complete visual equality:
-
-```swift
-static func == (lhs: Self, rhs: Self) -> Bool {
-    lhs.title == rhs.title &&
-    lhs.balanceText == rhs.balanceText &&
-    lhs.isLoading == rhs.isLoading
-}
-```
-
-## Equatable and Closures
+## Equatable and closures
 
 Do not make action closures part of `Equatable` comparison. Swift closures generally do not have meaningful value equality.
 
-Also avoid using `.equatable()` on a view whose behavior depends on changing closure values. If equality says the view is unchanged, but the action closure changed, the code becomes harder to reason about.
+Avoid `.equatable()` on a view whose behavior depends on changing closure values. If equality says the view is unchanged but the action changed, the code becomes harder to reason about.
 
 Prefer a purely visual equatable row plus actions attached outside that row:
-
-```swift
-struct ContactRow: View, Equatable {
-    let row: ContactRowModel
-
-    var body: some View {
-        HStack {
-            Text(row.name)
-            Spacer()
-            Text(row.statusText)
-        }
-    }
-}
-```
 
 ```swift
 ContactRow(row: row)
@@ -502,10 +396,6 @@ ContactRow(row: row)
         model.openContact(id)
     }
 ```
-
-This keeps equality focused on visible input and keeps behavior separate from the equality boundary.
-
-## Prefer Equatable Render Models
 
 For complex rows, it is often better to make the render model `Equatable` than to manually compare many view properties.
 
@@ -519,29 +409,9 @@ struct TransactionRowModel: Identifiable, Equatable {
 }
 ```
 
-```swift
-struct TransactionRow: View, Equatable {
-    let row: TransactionRowModel
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading) {
-                Text(row.title)
-                Text(row.subtitle)
-            }
-
-            Spacer()
-
-            Text(row.amountText)
-        }
-        .opacity(row.isPending ? 0.6 : 1)
-    }
-}
-```
-
 This works best when the render model is already prepared outside rendering and contains only display-ready values.
 
-## When Not to Use `.equatable()`
+## When not to use `.equatable()`
 
 Avoid `.equatable()` when:
 
@@ -555,22 +425,37 @@ Avoid `.equatable()` when:
 
 `Equatable` is a local optimization boundary, not a substitute for good dependency design.
 
-## Risk Levels
+## Validation
 
-Use low risk when:
+Use validation when unnecessary updates remain suspected after code review.
+
+Useful checks:
+
+- Add temporary `_printChanges()` to the suspected row or component.
+- Count body invocations for the repeated view during the target interaction.
+- Use the SwiftUI instrument to inspect body count, body duration, and unexpected updates.
+- Use Time Profiler when action builders, binding transformations, menu construction, or equality checks perform non-trivial CPU work.
+- Use Allocations when closures, action models, temporary strings, or render models are rebuilt repeatedly.
+- Use signposts around filter changes, page appends, menu construction, or major state assignments.
+
+Do not claim a numeric performance gain unless a trace, benchmark, signpost log, or user-provided measurement supports it.
+
+## Risk levels
+
+Low risk:
 
 - a closure appears in a small static view
 - a custom binding performs a tiny necessary transformation
-- `.equatable()` is used with complete and cheap visual equality
+- `.equatable()` uses complete and cheap visual equality
 
-Use medium risk when:
+Medium risk:
 
 - repeated rows store several action closures
 - custom bindings capture a parent model in a large form or list
 - closure capture lists are missing in a frequently updating parent
 - `.equatable()` compares multiple values manually and could become incomplete over time
 
-Use high risk when:
+High risk:
 
 - row closures capture large mutable models or whole parent views in a large collection
 - custom bindings perform expensive derived reads or index-based mutations in repeated content
@@ -578,52 +463,23 @@ Use high risk when:
 - `.equatable()` is used to hide broad invalidation instead of fixing dependencies
 - action builders do non-trivial work for every row during rendering
 
-## Suggested Refactoring Order
+## Suggested refactoring order
 
-For closure, binding, and equatable issues, prefer this order:
+1. 1Keep visual row data separate from action behavior.
+2. 2Capture stable IDs and narrow dependencies in closures.
+3. 3Replace unnecessary custom bindings with key-path bindings.
+4. 4Move binding transformation logic out of `body` when it grows.
+5. 5Reduce multiple closure properties to a smaller action surface when useful.
+6. 6Use `Equatable` only after visual inputs are clear and equality is cheap.
+7. 7Validate with profiling or temporary probes only when unnecessary updates remain suspected.
 
-1. Keep visual row data separate from action behavior.
-2. Capture stable IDs and narrow dependencies in closures.
-3. Replace unnecessary custom bindings with key-path bindings.
-4. Move binding transformation logic out of `body` when it grows.
-5. Reduce multiple closure properties to a smaller action surface when useful.
-6. Use `Equatable` only after visual inputs are clear and equality is cheap.
-7. Validate with profiling or temporary probes only when unnecessary updates remain suspected.
+## Common mistakes
 
-## Agent Wording
-
-Prefer:
-
-```md
-This row stores several non-visual action closures. In a large list, that can make row updates harder to reason about. Keep the row's stored input visual, attach actions at the list boundary, and capture only the model reference plus the row ID.
-```
-
-Prefer:
-
-```md
-This custom binding is not automatically wrong, but it hides transformation logic inside the render path. If no transformation is needed, use a key-path binding. If transformation is required, keep the closure small and avoid expensive derived reads.
-```
-
-Prefer:
-
-```md
-`.equatable()` is useful only if equality covers all visible inputs and is cheaper than recomputing the body. Do not use it to mask broad invalidation or omit state that changes the UI.
-```
-
-Avoid:
-
-```md
-Closures always make SwiftUI rows redraw.
-```
-
-Avoid:
-
-```md
-Custom bindings are bad for performance.
-```
-
-Avoid:
-
-```md
-Add `.equatable()` to fix this list.
-```
+- Do not say closures always make SwiftUI rows redraw.
+- Do not say custom bindings are bad for performance.
+- Do not add `.equatable()` as a default fix for list performance.
+- Do not compare non-visual closures in equality.
+- Do not omit visible state from equality to suppress updates.
+- Do not add action-routing architecture for one simple tap handler.
+- Do not move expensive binding transformation from `body` into another computed property that is still read by `body`.
+- Do not call an optimization successful without a validation path.
