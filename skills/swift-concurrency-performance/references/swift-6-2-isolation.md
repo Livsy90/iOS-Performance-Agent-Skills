@@ -1,120 +1,190 @@
 # Swift 6.2 Isolation and `@concurrent`
 
-Use this reference when reviewing Swift 6.2+ code that involves `@MainActor`, default actor isolation, `nonisolated`, `@concurrent`, CPU-heavy async functions, Sendable diagnostics, or code that unexpectedly remains on the caller’s actor.
+Use this reference when the task involves Swift 6.2 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
 
-## Core Rule
+This reference is for performance review. It helps the agent decide where async work actually runs, whether it accidentally remains on `MainActor`, and whether moving work across an isolation boundary is safe.
+
+## Contents
+
+- [Core model](#core-model)
+- [Review workflow](#review-workflow)
+- [Default actor isolation](#default-actor-isolation)
+- [`async` does not mean background](#async-does-not-mean-background)
+- [`@concurrent`](#concurrent)
+- [`nonisolated`](#nonisolated)
+- [`nonisolated` vs `@concurrent`](#nonisolated-vs-concurrent)
+- [Sendable boundary review](#sendable-boundary-review)
+- [MainActor refactoring pattern](#mainactor-refactoring-pattern)
+- [Migration-related performance regressions](#migration-related-performance-regressions)
+- [Common mistakes](#common-mistakes)
+- [Diagnostics](#diagnostics)
+- [Review checklist](#review-checklist)
+- [Source notes](#source-notes)
+
+## Core model
 
 Do not assume that `async` means “background”.
 
-In modern Swift, the execution context of an async function depends on actor isolation, compiler settings, and annotations. A function can be async and still run on the caller’s actor unless it explicitly switches away or calls something that does.
+In Swift 6.2-era code, the execution context of an async function depends on actor isolation, compiler settings, and annotations. A function can be async and still run on the caller’s actor.
 
 For performance review, always ask:
 
-* What actor is the caller isolated to?
-* Is the enclosing type `@MainActor`?
-* Is default actor isolation enabled?
-* Is this function `nonisolated`?
-* Is this function `@concurrent`?
-* Is the heavy work accidentally staying on `MainActor`?
-* Are values crossing an isolation boundary safe to send?
+- What actor is the caller isolated to?
+- Is the enclosing type explicitly or implicitly `@MainActor`?
+- Is default actor isolation enabled for this target or module?
+- Is the function actor-isolated, `nonisolated`, or `@concurrent`?
+- Does the function only suspend, or does it perform meaningful CPU work?
+- Are parameters, captures, and return values safe to send across an isolation boundary?
+- Is the suspected performance issue caused by where the work runs, or by the amount of work itself?
 
-## Important Terms
+## Review workflow
 
-### Actor-isolated
+1. 1Identify the user-visible symptom: UI stall, slow interaction, actor queue buildup, new Sendable diagnostics, or regression after enabling Swift 6.2 settings.
+2. 2Locate the caller’s isolation domain.
+3. 3Locate the callee’s isolation behavior.
+4. 4Check whether heavy work is running on `MainActor` or another hot actor.
+5. 5Check whether moving the work away would cross a Sendable boundary.
+6. 6Prefer immutable snapshots over moving mutable UI-owned reference objects.
+7. 7Use `@concurrent` only when leaving the caller’s actor is intentional and useful.
+8. 8Use `nonisolated` only when the member does not need isolated state.
+9. 9Validate the change with traces, signposts, UI responsiveness, or targeted tests.
 
-A declaration isolated to an actor or global actor.
+## Default actor isolation
 
-Example:
+Swift 6.2 adds project and package settings that can make declarations in a module infer `@MainActor` isolation by default.
+
+This can improve approachability for UI-heavy apps, but it changes the performance review question:
+
+> Is this code explicitly main-actor isolated, or did it become main-actor isolated because of the target’s default isolation setting?
+
+When default `MainActor` isolation is enabled, unannotated declarations may become main-actor isolated unless another rule applies.
+
+Review these cases carefully:
+
+- view models that combine UI state and data processing;
+- services placed in app targets rather than framework targets;
+- helper functions near UI code;
+- static utilities in UI modules;
+- protocol conformances that inherit isolation;
+- code that behaved differently after enabling Swift 6.2 settings.
+
+Prefer checking the build setting instead of guessing from the source file alone.
+
+### App-target risk
+
+Risky pattern:
 
 ```swift
-@MainActor
-final class DashboardModel {
-    var sections: [DashboardSection] = []
-}
-```
+// Target built with default MainActor isolation.
 
-Methods and mutable state on this type are main-actor isolated unless marked otherwise.
+final class SearchModel {
+    private(set) var rows: [SearchRow] = []
 
-### `nonisolated`
-
-Use `nonisolated` when a member does not access actor-isolated state.
-
-```swift
-actor ExchangeRateStore {
-    private var latestRates: [CurrencyPair: Rate] = [:]
-
-    nonisolated func normalize(_ pair: CurrencyPair) -> CurrencyPair {
-        CurrencyPair(
-            base: pair.base.uppercased(),
-            quote: pair.quote.uppercased()
-        )
+    func apply(_ payload: SearchPayload) {
+        rows = SearchRowBuilder.buildRows(from: payload)
     }
 }
 ```
 
-A `nonisolated` member cannot read or mutate `latestRates`.
+The code may look like a plain class, but in a target with default `MainActor` isolation it can become main-actor isolated. The row-building work may run on the main actor.
 
-### `@concurrent`
+Prefer separating UI coordination from processing:
 
-Use `@concurrent` when an async function should explicitly switch off the caller’s actor so that actor can continue making progress.
+```swift
+@MainActor
+final class SearchModel {
+    private(set) var rows: [SearchRow] = []
 
-This is useful when a caller is isolated to `MainActor` and the function performs meaningful CPU work that should not run on the main actor.
+    func apply(_ payload: SearchPayload) async {
+        rows = await buildSearchRows(from: payload.snapshot)
+    }
+}
 
-## Risk: Heavy Work Staying on MainActor
+@concurrent
+func buildSearchRows(from snapshot: SearchPayloadSnapshot) async -> [SearchRow] {
+    SearchRowBuilder.buildRows(from: snapshot)
+}
+```
+
+Before recommending this, verify that the snapshot and result are safe to send.
+
+## `async` does not mean background
+
+An async function may suspend. That does not prove that its synchronous work runs away from the caller’s actor.
 
 Risky:
 
 ```swift
 @MainActor
-final class SearchScreenModel {
-    private(set) var results: [SearchResultRow] = []
+final class DashboardModel {
+    private(set) var sections: [DashboardSection] = []
 
-    func applySnapshot(_ snapshot: SearchSnapshot) async {
-        results = SearchResultBuilder.buildRows(from: snapshot)
+    func refresh() async throws {
+        let payload = try await api.dashboard()
+        sections = DashboardBuilder.makeSections(from: payload)
     }
 }
 ```
 
-The method is async, but the heavy row-building work is still inside a main-actor-isolated method.
+The network call suspends, but the section-building work after the `await` still happens inside a main-actor-isolated method.
 
-Prefer moving the work to a function that explicitly switches away when appropriate:
+A better structure is to keep UI mutation small:
 
 ```swift
 @MainActor
-final class SearchScreenModel {
-    private(set) var results: [SearchResultRow] = []
+final class DashboardModel {
+    private(set) var sections: [DashboardSection] = []
 
-    func applySnapshot(_ snapshot: SearchSnapshot) async {
-        results = await buildSearchRows(from: snapshot)
+    func refresh() async throws {
+        let payload = try await api.dashboard()
+        sections = try await makeDashboardSections(from: payload.snapshot)
     }
 }
 
 @concurrent
-func buildSearchRows(from snapshot: SearchSnapshot) async -> [SearchResultRow] {
-    SearchResultBuilder.buildRows(from: snapshot)
+func makeDashboardSections(from snapshot: DashboardSnapshot) async throws -> [DashboardSection] {
+    try Task.checkCancellation()
+    return DashboardBuilder.makeSections(from: snapshot)
 }
 ```
 
-Before recommending this, verify that `SearchSnapshot` and `SearchResultRow` are safe to send across the boundary.
+Use this pattern only when the builder does meaningful work and the values crossing the boundary are safe.
 
-Prefer value types:
+## `@concurrent`
+
+Use `@concurrent` when an async function should explicitly leave the caller’s actor.
+
+This is useful when:
+
+- the caller is `@MainActor`;
+- the callee performs meaningful CPU work;
+- the caller’s actor should remain responsive;
+- the function does not need actor-isolated state;
+- inputs and outputs can safely cross the isolation boundary.
+
+Good use:
 
 ```swift
-struct SearchSnapshot: Sendable {
-    let items: [SearchItem]
+@MainActor
+final class ReportModel {
+    private(set) var report: Report?
+
+    func reload() async throws {
+        let data = try await reportService.loadData()
+        report = try await compileReport(from: data.snapshot)
+    }
 }
 
-struct SearchResultRow: Sendable {
-    let title: String
-    let subtitle: String
+@concurrent
+func compileReport(from snapshot: ReportSnapshot) async throws -> Report {
+    try Task.checkCancellation()
+    return ReportCompiler.compile(snapshot)
 }
 ```
 
-Do not move UI-owned reference models away from `MainActor` just to silence performance concerns.
+### `@concurrent` is not a magic optimizer
 
-## `@concurrent` Is Not a Magic Optimizer
-
-`@concurrent` can move work away from the caller’s actor. It does not automatically make long synchronous computation cooperative.
+`@concurrent` can move execution away from the caller’s actor. It does not make CPU-heavy work automatically parallel, cancellable, or cheap.
 
 Risky:
 
@@ -125,9 +195,9 @@ func buildHugeIndex(from records: [Record]) async -> SearchIndex {
 }
 ```
 
-This may avoid blocking `MainActor`, but the computation can still monopolize a worker thread for a long time.
+This may avoid blocking `MainActor`, but the work can still monopolize a cooperative worker thread for a long time.
 
-For long work, consider chunking and cancellation:
+For long-running work, consider chunking and cancellation:
 
 ```swift
 @concurrent
@@ -144,25 +214,83 @@ func buildHugeIndex(from records: [Record]) async throws -> SearchIndex {
 }
 ```
 
-Use `Task.yield()` selectively. It can improve responsiveness in long cooperative loops, but it is not a substitute for good algorithmic design or measurement.
+Use `Task.yield()` selectively. It is a responsiveness tool for long cooperative loops, not a substitute for good algorithms or measurement.
 
-## Sendable Boundary Review
+## `nonisolated`
 
-When recommending `@concurrent`, check what crosses the boundary:
+Use `nonisolated` when a member does not need actor-isolated state.
 
-* parameters
-* return values
-* captured values
-* stored dependencies
-* closures
-* reference types
-* mutable shared state
+Good use:
+
+```swift
+actor SymbolStore {
+    private var symbols: [String: Symbol] = [:]
+
+    nonisolated func canonicalSymbol(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+}
+```
+
+The method is pure and does not read or mutate `symbols`.
+
+Do not use `nonisolated` to bypass actor isolation for convenience. If the code needs actor state, it should stay isolated or receive a safe snapshot.
+
+Risky:
+
+```swift
+actor ImageCache {
+    private var storage: [URL: Image] = [:]
+
+    nonisolated func cachedImage(for url: URL) -> Image? {
+        storage[url]
+    }
+}
+```
+
+This is not a valid escape from actor isolation. The method tries to access actor-isolated mutable state.
+
+## `nonisolated` vs `@concurrent`
+
+They solve different problems.
+
+Use `nonisolated` when:
+
+- the member does not need actor state;
+- the operation is pure, cheap, or based only on inputs;
+- the goal is to avoid unnecessary actor isolation for a member.
+
+Use `@concurrent` when:
+
+- the function is async;
+- it should explicitly leave the caller’s actor;
+- the operation does meaningful work;
+- moving the work away improves responsiveness or avoids actor contention;
+- the boundary is Sendable-safe.
+
+Do not replace one with the other mechanically.
+
+### Decision table
+
+
+## Sendable boundary review
+
+When recommending `@concurrent`, check every value crossing the boundary:
+
+- parameters;
+- return values;
+- captured values;
+- stored dependencies;
+- closures;
+- reference types;
+- mutable shared state;
+- objects owned by UI state.
 
 Risky:
 
 ```swift
 @MainActor
-final class ExportScreenModel {
+final class ExportModel {
     private let draft: MutableExportDraft
 
     func preview() async -> ExportPreview {
@@ -178,7 +306,7 @@ func makePreview(from draft: MutableExportDraft) async -> ExportPreview {
 
 A mutable UI-owned reference object should usually stay on `MainActor`.
 
-Prefer extracting a Sendable snapshot:
+Prefer a Sendable snapshot:
 
 ```swift
 struct ExportDraftSnapshot: Sendable {
@@ -188,7 +316,7 @@ struct ExportDraftSnapshot: Sendable {
 }
 
 @MainActor
-final class ExportScreenModel {
+final class ExportModel {
     private let draft: MutableExportDraft
 
     func preview() async -> ExportPreview {
@@ -203,100 +331,17 @@ func makePreview(from snapshot: ExportDraftSnapshot) async -> ExportPreview {
 }
 ```
 
-The UI model remains isolated to `MainActor`; the background work receives immutable data.
+The UI model remains isolated. The background work receives immutable data.
 
-## `nonisolated` vs `@concurrent`
+## MainActor refactoring pattern
 
-Use `nonisolated` when a member does not need actor state.
+The safest pattern is usually:
 
-Use `@concurrent` when an async function should explicitly leave the caller’s actor.
-
-They solve different problems.
-
-### Good `nonisolated` Use
-
-```swift
-actor SymbolStore {
-    private var symbols: [String: Symbol] = [:]
-
-    nonisolated func canonicalSymbol(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-    }
-}
-```
-
-The method is pure and does not need actor state.
-
-### Good `@concurrent` Use
-
-```swift
-@MainActor
-final class ReportModel {
-    private(set) var report: Report?
-
-    func reload() async throws {
-        let data = try await reportService.load()
-        report = try await compileReport(data)
-    }
-}
-
-@concurrent
-func compileReport(_ data: ReportData) async throws -> Report {
-    try ReportCompiler.compile(data)
-}
-```
-
-The compile step is meaningful work that should not run on the main actor.
-
-## Do Not Add `@concurrent` Everywhere
-
-Avoid `@concurrent` when:
-
-* the function is cheap
-* the function already runs off the main actor
-* the function must remain on the caller’s actor for correctness
-* the values are not safe to send
-* the operation is mostly awaiting another async API
-* there is no measured or plausible responsiveness issue
-
-Risky overuse:
-
-```swift
-@concurrent
-func title(for item: MenuItem) async -> String {
-    item.title
-}
-```
-
-This adds async and isolation complexity without a performance reason.
-
-Prefer simple synchronous code:
-
-```swift
-func title(for item: MenuItem) -> String {
-    item.title
-}
-```
-
-## Default Actor Isolation
-
-With default actor isolation settings, especially in app targets, code may be more main-actor-oriented than expected.
-
-When reviewing new Swift code, check whether the project uses default MainActor isolation. If it does, many declarations may be main-actor isolated unless explicitly written otherwise.
-
-This can be helpful for UI safety, but it can hide performance issues when heavy work is added to types that are implicitly main-actor isolated.
-
-Review questions:
-
-* Is this type UI-facing?
-* Is it intentionally `@MainActor`?
-* Is heavy work mixed into the UI-facing type?
-* Should the heavy work be moved to a separate service or free function?
-* Should the service remain nonisolated?
-* Should CPU work use `@concurrent`?
-* Are Sendable snapshots used instead of mutable UI references?
-
-## MainActor Refactoring Pattern
+1. 1keep UI state and UI mutation on `MainActor`;
+2. 2extract immutable input data;
+3. 3perform heavy work in a separate async function that intentionally leaves the caller’s actor;
+4. 4return a Sendable result;
+5. 5assign the final result back on `MainActor`.
 
 Before:
 
@@ -321,119 +366,117 @@ final class InsightsModel {
 
     func refresh() async throws {
         let events = try await eventService.loadEvents()
-        insights = try await computeInsightRows(from: events)
+        insights = try await computeInsightRows(from: EventSnapshot(events))
     }
 }
 
 @concurrent
-func computeInsightRows(from events: [Event]) async throws -> [InsightRow] {
+func computeInsightRows(from snapshot: EventSnapshot) async throws -> [InsightRow] {
     try Task.checkCancellation()
-    return InsightEngine.computeRows(from: events)
+    return InsightEngine.computeRows(from: snapshot)
 }
 ```
 
-Better for larger work:
+For larger workloads, add chunking and cancellation checks.
+
+## Migration-related performance regressions
+
+Swift 6.2 isolation changes can make code safer and easier to migrate, but they can also move work onto `MainActor` more often than expected.
+
+Watch for regressions after:
+
+- enabling default `MainActor` isolation for a target;
+- moving code into an app target that has default `MainActor` isolation;
+- converting view models or services to `@MainActor`;
+- fixing Sendable diagnostics by adding broad actor isolation;
+- replacing compiler errors with `Task {}` or `Task.detached`;
+- adding `@concurrent` broadly without checking Sendable boundaries.
+
+Common regression pattern:
 
 ```swift
-@concurrent
-func computeInsightRows(from events: [Event]) async throws -> [InsightRow] {
-    var rows: [InsightRow] = []
-    rows.reserveCapacity(events.count)
+// Before migration this helper lived in a nonisolated module.
+// After migration it lives in a target with default MainActor isolation.
 
-    for chunk in events.chunked(into: 250) {
-        try Task.checkCancellation()
-        rows.append(contentsOf: InsightEngine.computeRows(from: chunk))
-        await Task.yield()
-    }
-
-    return rows
+func normalizeTimeline(_ payload: TimelinePayload) -> [TimelineRow] {
+    TimelineNormalizer.normalize(payload)
 }
 ```
 
-## Avoid Mixing UI State and Work Engines
+The helper may now run as part of main-actor-isolated code. If it is heavy, move it to a nonisolated service module or an explicit `@concurrent` async boundary with Sendable inputs.
 
-A common design smell:
+Prefer this review question:
 
-```swift
-@MainActor
-final class TimelineViewModel {
-    var rows: [TimelineRow] = []
+> Did the migration change where this code executes, or only how the compiler describes it?
 
-    func load() async throws {
-        let raw = try await api.timeline()
-        rows = TimelineProcessor.process(raw)
-    }
+## Common mistakes
 
-    private func normalize(_ event: TimelineEvent) -> TimelineEvent {
-        TimelineNormalizer.normalize(event)
-    }
-}
-```
-
-The type owns UI state and also contains processing logic. With main-actor isolation, processing can accidentally stay on the main actor.
-
-Prefer separating UI coordination from processing:
-
-```swift
-@MainActor
-final class TimelineViewModel {
-    private let processor: TimelineProcessing
-    private(set) var rows: [TimelineRow] = []
-
-    init(processor: TimelineProcessing) {
-        self.processor = processor
-    }
-
-    func load() async throws {
-        let raw = try await api.timeline()
-        rows = try await processor.rows(from: raw)
-    }
-}
-
-struct TimelineProcessor: TimelineProcessing {
-    func rows(from raw: TimelinePayload) async throws -> [TimelineRow] {
-        try await buildTimelineRows(from: raw)
-    }
-}
-
-@concurrent
-func buildTimelineRows(from raw: TimelinePayload) async throws -> [TimelineRow] {
-    TimelineRowBuilder.build(from: raw)
-}
-```
+- Treating `async` as proof that work is not on the main actor.
+- Adding `@concurrent` everywhere after seeing one main-actor stall.
+- Using `Task.detached` instead of understanding isolation.
+- Moving mutable UI reference objects across isolation boundaries.
+- Marking a whole type `@MainActor` because one property updates UI.
+- Keeping data processing methods inside UI-facing `@MainActor` models.
+- Using `nonisolated` to escape actor isolation while still needing actor state.
+- Ignoring default actor isolation settings during review.
+- Treating Sendable diagnostics as noise instead of a boundary design signal.
+- Calling `Task.yield()` a performance fix without measuring.
 
 ## Diagnostics
 
-Use Instruments when isolation behavior is uncertain.
+Use Instruments or signposts when isolation behavior is uncertain.
 
-Symptoms:
+Look for:
 
-* UI freezes while an async method is running
-* `@MainActor` task has a long running section after an `await`
-* CPU-heavy work appears on main actor
-* adding `async` did not improve responsiveness
-* code behaves differently after enabling Swift 6.2 settings
-* concurrency diagnostics complain about sending non-Sendable values
-* task appears concurrent but throughput does not improve
+- UI freezes while an async method is running;
+- long main-actor sections after an `await`;
+- CPU-heavy work on the main actor;
+- actor queue buildup around one UI-facing type;
+- Sendable diagnostics after adding `@concurrent`;
+- performance regressions after enabling Swift 6.2 settings;
+- code that appears async but does not improve responsiveness.
 
 Likely causes:
 
-* heavy work remains actor-isolated
-* function is async but not switching off the caller’s actor
-* non-Sendable reference state cannot safely cross isolation
-* work is serialized through a main-actor type
-* the real bottleneck is another actor or service
+- heavy work remains actor-isolated;
+- an async function does not leave the caller’s actor;
+- default actor isolation made a helper `@MainActor`;
+- non-Sendable reference state cannot cross the boundary;
+- work is serialized through a UI-facing actor;
+- the real bottleneck is another actor or service.
 
-## Review Checklist
+Validation options:
 
-* [ ] Is the caller isolated to `MainActor` or another actor?
-* [ ] Is default actor isolation enabled?
-* [ ] Is the function merely async, or does it explicitly switch away?
-* [ ] Is `@concurrent` justified by meaningful work?
-* [ ] Are parameters, captures, and return values safe to send?
-* [ ] Can mutable UI state be converted to a Sendable snapshot?
-* [ ] Would `nonisolated` be more appropriate than `@concurrent`?
-* [ ] Is the heavy work cancellable?
-* [ ] Does long CPU work need chunking or yielding?
-* [ ] Is the suggested change measured or tied to a concrete responsiveness issue?
-* [ ] Can the design be improved by separating UI coordination from processing?
+- add signposts around the heavy computation and final UI assignment;
+- record a trace and inspect main-thread or main-actor activity;
+- compare before/after interaction latency;
+- log current task/request identifiers around duplicate work;
+- add cancellation tests for long-running computation;
+- check memory if snapshots copy large data.
+
+## Review checklist
+
+Before recommending a Swift 6.2 isolation change, check:
+
+- [ ] Is the caller isolated to `MainActor` or another actor?
+- [ ] Is default actor isolation enabled for this target?
+- [ ] Is the callee explicitly isolated, implicitly isolated, `nonisolated`, or `@concurrent`?
+- [ ] Is the slow work CPU-heavy, blocking, or mostly awaiting another async API?
+- [ ] Would `@concurrent` actually move meaningful work off the caller’s actor?
+- [ ] Are parameters, captures, dependencies, and return values safe to send?
+- [ ] Can mutable UI state be converted to a Sendable snapshot?
+- [ ] Would `nonisolated` be more appropriate than `@concurrent`?
+- [ ] Does the heavy work need cancellation checks?
+- [ ] Does long CPU work need chunking or yielding?
+- [ ] Is broad `@MainActor` isolation hiding processing work?
+- [ ] Is the recommendation validated with a trace, signpost, test, or reproducible UI behavior?
+
+## Source notes
+
+This reference is based on Swift 6.2-era concurrency behavior and should be checked against current Swift documentation when language rules change.
+
+Useful primary sources:
+
+- Swift Evolution SE-0461: Run nonisolated async functions on the caller's actor by default.
+- Swift Evolution SE-0466: Control default actor isolation inference.
+- Swift migration guidance for data-race safety and concurrency adoption.
