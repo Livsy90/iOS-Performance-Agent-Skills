@@ -1,6 +1,6 @@
 ---
 name: swiftui-performance
-description: Review and refactor SwiftUI screen performance issues caused by unstable identity, broad state dependencies, expensive body work, heavy lists or rows, layout/drawing cost, animation hitches, closure-heavy inputs, custom bindings, or async lifecycle work. Use for SwiftUI code reviews and targeted refactors. Do not use for UIKit-only issues, app launch performance, backend/network latency, or generic profiling unless SwiftUI update behavior is central.
+description: Use this skill when reviewing or fixing SwiftUI performance issues, including unnecessary invalidation, unstable identity, broad state dependencies, expensive body work, heavy rows, scrolling hitches, layout/drawing cost, or async lifecycle work. Do not use it for general SwiftUI syntax, styling, UIKit-only performance, or generic profiling unless SwiftUI update behavior is central.
 ---
 
 # SwiftUI Performance
