@@ -1,255 +1,368 @@
----
+# Lists, Pagination, and Rows
 
-name: swiftui-performance
-description: Use this skill when reviewing or refactoring SwiftUI screens for unnecessary updates, slow scrolling, heavy rows, broad state dependencies, unstable identity, animation hitches, expensive body work, list pagination problems, closure-heavy row views, custom bindings, Observation or ObservableObject granularity, async lifecycle work, or profiling validation with Instruments, xctrace, signposts, XCTest, and MetricKit.
----
+Use this reference when the task involves SwiftUI `List`, `ScrollView`, `LazyVStack`, feeds, paginated data, row complexity, scroll hitches, duplicate pagination loads, expensive append/update paths, or list performance regressions.
 
-# SwiftUI Performance
+## Contents
 
-## Purpose
+- [Core model](#core-model)
+- [Start from the symptom](#start-from-the-symptom)
+- [Choosing the container](#choosing-the-container)
+- [Stable identity](#stable-identity)
+- [Row cost](#row-cost)
+- [Pagination and update locality](#pagination-and-update-locality)
+- [Do not derive pages inside `body`](#do-not-derive-pages-inside-body)
+- [Filtering, sorting, and formatting](#filtering-sorting-and-formatting)
+- [Row interactions](#row-interactions)
+- [Layout and geometry](#layout-and-geometry)
+- [Pagination triggers](#pagination-triggers)
+- [Background work and UI headroom](#background-work-and-ui-headroom)
+- [Validation](#validation)
+- [Common mistakes](#common-mistakes)
 
-Use this skill to review, generate, and refactor SwiftUI code with a performance-first mental model focused on change locality.
+## Core model
 
-This skill is primarily about SwiftUI code composition: identity, lifetime, dependency scope, state ownership, row complexity, list structure, layout cost, drawing cost, and async lifecycle work.
+Large, growing, scrolling, or frequently updating collections are SwiftUI hot paths.
 
-Profiling is a validation layer. Use profiling tools only when the environment supports them or when the user provides profiling artifacts.
+Optimize lists for stable identity, cheap row construction, predictable structure, narrow state dependencies, explicit pagination boundaries, and local updates that make the changed unit obvious.
 
-## Non-Goals
+A performant list makes it clear what changed: one row, one page, one loading footer, one filter result, or one selection state. If every append, filter, sort, or small state change forces SwiftUI to reconcile a large unstable structure, scrolling and pagination become fragile.
 
-Do not turn every SwiftUI review into a profiling session.
+## Start from the symptom
 
-Do not recommend broad architectural rewrites for small static views unless there is a clear performance risk.
+Do not optimize a list only because the code looks complex.
 
-Do not claim that a performance issue was measured unless there is actual evidence from Instruments, `xctrace`, XCTest performance tests, signpost logs, MetricKit payloads, user-provided traces, screenshots, logs, or benchmark results.
+First identify the user-facing symptom: scroll hitches, a frozen "Load more" tap, a main-thread spike during append, unrelated row updates, duplicate page loads, memory growth while scrolling, or hitches during search/filter/sort.
 
-Do not describe SwiftUI as generically slow. Explain the concrete update, dependency, identity, layout, drawing, or scheduling issue.
+Then connect the symptom to a likely hot path: collection identity, row body cost, repeated data preparation, pagination append structure, per-row layout work, row interactions, or main-actor work during list updates.
 
-## Core Mental Model
+Avoid replacing the list container, introducing sections, or rewriting rows until the suspected bottleneck matches the symptom.
 
-Reason about SwiftUI performance through three concepts:
+## Choosing the container
 
-* Identity: whether SwiftUI treats a view as the same view across updates.
-* Lifetime: how long state associated with that identity is preserved.
-* Dependencies: which data reads cause a view to update.
+Do not treat `List`, `LazyVStack`, and `VStack` as interchangeable.
 
-A SwiftUI view is a value description of UI. Do not treat it as a long-lived UIKit-style object.
+Prefer `List` when the UI needs platform-native long-list behavior, swipe actions, editing, selection, accessibility behavior, native row styling, or large dynamic datasets where system behavior matters.
 
-When reviewing code, explain performance issues in terms of:
+Prefer `ScrollView` with `LazyVStack` or `LazyHStack` when the UI needs custom spacing, card layouts, mixed static and dynamic regions, pinned content, or more layout control than `List` provides.
 
-* what changed
-* which view depends on that change
-* how much of the view tree becomes affected
-* whether identity is stable
-* whether rendering work is cheap
-* whether the structure keeps local updates local
+Use `VStack` only for small, fixed-size content.
 
-Prefer precise wording:
+Avoid eager stacks for long dynamic collections:
 
-* "This parent view reads the whole model, so changes to this model can invalidate a large part of the screen."
-* "This row receives non-visual closure inputs, which can make row equality and update behavior harder to reason about."
-* "This list rebuilds derived row data during rendering, so appending or filtering can create avoidable work on the update path."
-
-## Review Workflow
-
-1. Identify the symptom, request, or risk:
-
-   * unnecessary updates
-   * slow scrolling
-   * heavy rows
-   * broad state dependencies
-   * unstable identity
-   * expensive `body` work
-   * animation hitches
-   * layout or drawing cost
-   * pagination update bursts
-   * async lifecycle problems
-   * profiling validation
-
-2. Classify the issue:
-
-   * identity and lifetime
-   * dependency scope
-   * state ownership
-   * `body` cost
-   * render model preparation
-   * list, row, or pagination structure
-   * closure, binding, or action handler stability
-   * layout, drawing, or animation cost
-   * async lifecycle or main actor work
-   * profiling evidence or measurement plan
-
-3. Inspect the smallest relevant code path before suggesting broad changes.
-
-4. Prefer targeted refactors over architectural rewrites.
-
-5. Separate static code review findings from hypotheses and measured results.
-
-6. Suggest profiling, debug probes, or instrumentation only when confirmation is useful or requested.
-
-## Refactoring Order
-
-When fixing SwiftUI performance risks, prefer this order:
-
-1. Stabilize identity.
-2. Remove expensive work from `body`.
-3. Prepare render-ready models outside rendering.
-4. Narrow view dependencies.
-5. Move local state closer to the component that owns it.
-6. Split large views into dependency-focused subviews.
-7. Improve list, row, and pagination structure.
-8. Simplify row inputs and repeated view structure.
-9. Remove unnecessary type erasure from hot paths.
-10. Reduce closure-heavy stored row inputs.
-11. Prefer key-path bindings over custom closure bindings when no transformation is needed.
-12. Use `Equatable` only when visual equality is clear and useful.
-13. Simplify layout, geometry, drawing, and animation work.
-14. Add profiling or temporary debug probes to validate the hypothesis when needed.
-15. Consider UIKit only for genuinely hot paths that need lower-level control.
-
-## Evidence Rule
-
-Always distinguish between:
-
-* static code review findings
-* likely risks
-* hypotheses
-* measured results
-* user-provided evidence
-* tool-generated evidence
-
-Do not invent numbers or claim profiling results unless actual evidence is available.
-
-Avoid unsupported claims such as:
-
-```md
-This costs 500 ms.
+```swift
+ScrollView {
+    VStack {
+        ForEach(feedRows) { row in FeedCard(row: row) }
+    }
+}
 ```
 
-Prefer:
+Prefer a lazy container for dynamic content:
 
-```md
-This can cause broad invalidation. To confirm it, profile the append interaction with signposts around page insertion and inspect body invocation frequency or Time Profiler samples.
+```swift
+ScrollView {
+    LazyVStack(spacing: 12) {
+        ForEach(feedRows) { row in FeedCard(row: row) }
+    }
+}
 ```
 
-## Profiling Capability Rules
+Do not recommend replacing `List` with `LazyVStack` as a default performance fix. Explain reuse, memory behavior, OS/version behavior, accessibility, editing, swipe actions, and row complexity trade-offs. `LazyVStack` is lazy construction, not UIKit-style cell reuse.
 
-The agent may use profiling tools only when the environment supports them.
+## Stable identity
 
-Before attempting profiling, check whether the task has:
+Large collections need stable, cheap identifiers.
 
-* a macOS host
-* a full Xcode installation
-* a selected Xcode path
-* a buildable project
-* a runnable target
-* an available simulator or device
-* a reproducible user scenario
-* permission to run shell commands
-* permission to create trace or log artifacts
+Avoid index-based identity when insertion, deletion, sorting, filtering, or pagination can change positions:
 
-If tools are unavailable, provide a local profiling plan and, when useful, suggest instrumentation code.
+```swift
+ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+    TransactionRow(row: row)
+}
+```
 
-Never pretend to have run Instruments, `xctrace`, XCTest, or MetricKit analysis when no command was run and no artifact was provided.
+Prefer identity from the data:
 
-## Reference Routing
+```swift
+ForEach(rows) { row in
+    TransactionRow(row: row)
+}
+```
 
-Use the references only when the task needs that level of detail.
+Avoid computed IDs that create a new value on every access:
 
-Read `references/identity-and-state.md` when the task involves structural identity, explicit `.id(...)`, `ForEach` identity, local state lifetime, `@State`, `@StateObject`, `@ObservedObject`, or owned observable models.
+```swift
+struct RowModel: Identifiable {
+    var id: UUID { UUID() }
+}
+```
 
-Read `references/observation-and-dependencies.md` when the task involves Observation, `ObservableObject`, `@Published`, broad model dependencies, computed properties that read many fields, environment dependencies, or splitting screens into dependency islands.
+Prefer stored identity:
 
-Read `references/body-cost-and-render-models.md` when the task involves expensive work in `body`, sorting, filtering, grouping, formatting, computed properties, render model preparation, or main-actor data transformation.
+```swift
+struct RowModel: Identifiable, Equatable {
+    let id: Transaction.ID
+    let title: String
+    let amountText: String
+}
+```
 
-Read `references/lists-pagination-and-rows.md` when the task involves `List`, `ScrollView`, `LazyVStack`, `ForEach`, large collections, row complexity, filtering inside repeated content, pagination, section/page models, swipe actions, menus, or scrolling performance.
+Use `.id(...)` only for a deliberate identity boundary, such as resetting local state or defining scroll targets. Do not use `.id(UUID())` as a refresh workaround.
 
-Read `references/closures-bindings-and-equatable.md` when the task involves stored closures in views, capture lists, action handlers, gestures, custom `Binding(get:set:)`, key-path bindings, `.equatable()`, or Equatable view inputs.
+## Row cost
 
-Read `references/layout-drawing-and-animation.md` when the task involves modifier chains, `GeometryReader`, `PreferenceKey`, layout feedback, shadows, masks, blurs, `Canvas`, `TimelineView`, animation hitches, Core Animation, or drawing-heavy UI.
+Rows in large lists should mostly render already prepared values.
 
-Read `references/async-lifecycle-and-mainactor.md` when the task involves `.task(id:)`, `.onAppear`, row lifecycle callbacks, duplicate loading, pagination triggers, cancellation, `Task`, `MainActor`, or heavy work during UI updates.
+Watch for repeated work in row `body`, row initializers, row modifiers, and computed properties read by rows: currency/date formatting, localized string construction, image decoding/resizing, icon lookup, sorting or filtering child data, expensive computed properties, database reads, synchronous file access, long modifier chains, overlays, masks, shadows, and blurs.
 
-Read `references/profiling-validation.md` when the user asks for profiling help or provides Instruments traces, `xctrace` output, signpost logs, XCTest benchmark results, MetricKit payloads, screen recordings, memory graphs, or other performance artifacts.
+Risky:
 
-## Code Review Checklist
+```swift
+Text(transaction.amount.formatted(.currency(code: transaction.currencyCode)))
+Image(categoryIconName(for: transaction.category))
+```
 
-When reviewing SwiftUI code, check:
+Prefer render-ready row models for non-trivial rows:
 
-* Does the view read only the state it needs?
-* Is state owned by the smallest stable component that needs it?
-* Is identity stable and intentional?
-* Is `body` free from expensive transformation work?
-* Are render models prepared outside rendering when rows are non-trivial?
-* Are large lists using stable IDs and an appropriate lazy container?
-* Are pagination updates local and not rebuilding old render data unnecessarily?
-* Are rows visually lightweight and structurally predictable?
-* Are closure-heavy row inputs avoided or intentionally designed?
-* Are custom bindings necessary, or would key-path bindings be enough?
-* Are layout, drawing, and animation costs appropriate for repeated content?
-* Is async work started from lifecycle modifiers or explicit actions, not from `body`?
-* Is profiling evidence separated from static review hypotheses?
+```swift
+struct TransactionRowModel: Identifiable, Equatable {
+    let id: Transaction.ID
+    let title: String
+    let amountText: String
+    let categoryIconName: String
+}
+```
 
-## Common Red Flags
+The row should mostly render `TransactionRowModel` values instead of preparing display data. Render-ready models are especially useful in long lists, paginated feeds, search results, and frequently refreshed screens.
 
-Flag these patterns during review:
+## Pagination and update locality
 
-* unstable IDs such as `.id(UUID())`
-* computed identifiers such as `var id: UUID { UUID() }`
-* index-based identity for mutable collections
-* sorting, filtering, grouping, formatting, parsing, decoding, or database reads inside `body`
-* filtering inside `ForEach` instead of preparing visible rows first
-* passing one giant model into every child view
-* broad computed properties that hide many state reads
-* `AnyView` inside large repeated collections
-* custom conditional modifier helpers that create structural instability in hot paths
-* custom `Binding(get:set:)` when a key-path binding would work
-* row views that store many non-visual action closures
-* `GeometryReader` inside every row of a large collection
-* heavy shadows, masks, blurs, overlays, or preference keys in repeated views
-* async work started directly from `body`
-* unguarded `.onAppear` pagination triggers inside rows
+For paginated data with non-trivial rows, avoid modeling the UI as one endlessly growing flat array when appending a page causes broad reconciliation or visible hitches.
 
-## Agent Response Format for Code Reviews
+Risky when rows are expensive:
 
-When reviewing code, use this structure:
+```swift
+List {
+    ForEach(model.transactions) { transaction in
+        TransactionRow(row: transaction)
+    }
+}
+```
 
-1. Main issue
-2. Why it matters in SwiftUI
-3. Risk level
-4. Suggested refactor
-5. Before/after code when useful
-6. What to measure if confirmation is needed
-7. Expected effect
+Appending to one large flat array can force SwiftUI to reconcile the collection from the flat list boundary. Even if only new elements were appended, the parent `ForEach` still observes one changed collection, and expensive rows can make this update path visible as a hitch.
 
-Keep explanations concrete. Avoid generic statements like "SwiftUI is slow."
+Prefer stable page or section models when pages are appended incrementally, existing rows should remain unchanged, rows include formatting/icons/menus/swipe actions/bindings/conditional modifiers, or profiling shows a main-thread spike during page append.
 
-## Agent Response Format for Profiling Requests
+Example:
 
-When the user asks for profiling help, use this structure:
+```swift
+struct TransactionPage: Identifiable, Equatable {
+    let id: Int
+    let rows: [TransactionRowModel]
+}
 
-1. Reproducible scenario
-2. Hypothesis
-3. Tool choice
-4. Exact command or local steps when possible
-5. What to look for
-6. How to interpret findings
-7. Refactor candidates
-8. How to compare before and after
+List {
+    ForEach(model.pages) { page in
+        Section {
+            ForEach(page.rows) { row in TransactionRow(row: row) }
+        }
+    }
+}
+```
 
-Never claim measurements that were not actually taken.
+Append a new page instead of rebuilding previous pages:
 
-## Final Principle
+```swift
+@MainActor
+func appendPage(_ response: TransactionPageResponse) {
+    pages.append(TransactionPage(
+        id: response.pageNumber,
+        rows: response.items.map(TransactionRowModel.init)
+    ))
+}
+```
 
-SwiftUI performance improves when code makes change locality obvious.
+The goal is not to use `Section` for its own sake. The goal is to make the changed unit explicit: one new page, one new section, one loading footer, or one changed row.
 
-Optimize for:
+Stable page boundaries can reduce repeated reconciliation and row construction work during pagination, especially when old pages do not change. This is a pattern to test, not a guarantee.
 
-* stable identity
-* narrow dependencies
-* cheap rendering
-* predictable structure
-* local state ownership
-* lightweight row inputs
-* explicit update boundaries
-* clear async lifecycle
-* measured validation when needed
+## Do not derive pages inside `body`
+
+Do not create page sections by chunking a flat array inside `body`.
+
+Risky:
+
+```swift
+List {
+    ForEach(model.transactions.chunked(into: 20)) { page in
+        Section {
+            ForEach(page) { transaction in TransactionRow(transaction: transaction) }
+        }
+    }
+}
+```
+
+This can allocate new page values during rendering, create unstable page identity, and hide the real pagination boundary.
+
+Prefer storing pages as stable state:
+
+```swift
+@Observable
+final class TransactionsModel {
+    var pages: [TransactionPage] = []
+}
+```
+
+If the backend returns pages, preserve that boundary in the UI model. If the backend returns a flat result, create stable page models during data ingestion, not during view rendering.
+
+## Filtering, sorting, and formatting
+
+Avoid transforming the collection inside repeated rendering paths.
+
+Risky:
+
+```swift
+ForEach(model.transactions.sorted { $0.date > $1.date }) { transaction in ... }
+ForEach(model.transactions) { if $0.matches(filter) { TransactionRow(transaction: $0) } }
+```
+
+Prefer preparing visible rows before rendering:
+
+```swift
+List(model.visibleRows) { row in
+    TransactionRow(row: row)
+}
+```
+
+Prepare render models when data is loaded, a page is appended, search text changes, sort order changes, or filter state changes. Then apply one compact state update on the main actor.
+
+## Row interactions
+
+Treat row-level interactions as part of row complexity.
+
+Rows become more expensive when every row builds `swipeActions`, menus, context menus, gestures, buttons, custom bindings, or closure-heavy action surfaces.
+
+Closures created inside `body` can make row values less stable because SwiftUI cannot meaningfully compare closures.
+
+Prefer keeping stored row input visual and small. When closures are necessary, use explicit capture lists and capture stable IDs instead of whole parent values:
+
+```swift
+ForEach(page.rows) { row in
+    TransactionRow(row: row)
+        .onTapGesture { [model, id = row.id] in model.openTransaction(id) }
+        .swipeActions {
+            Button("Archive") { [model, id = row.id] in model.archiveTransaction(id) }
+        }
+}
+```
+
+This does not make closures automatically diffable. It reduces accidental captures, keeps row inputs cleaner, and makes dependencies easier to reason about.
+
+## Layout and geometry
+
+Avoid per-row layout probes in large collections.
+
+Risky:
+
+```swift
+List(cards) { card in
+    GeometryReader { proxy in
+        LoyaltyCardView(card: card, width: proxy.size.width)
+    }
+}
+```
+
+Prefer reading geometry at a stable container boundary or using layout APIs that do not need explicit geometry:
+
+```swift
+LoyaltyCardView(card: card)
+    .frame(maxWidth: .infinity, alignment: .leading)
+```
+
+Review rows carefully when they contain `GeometryReader`, preference keys, nested scroll views, repeated overlays, masks, shadows, blurs, animated layout changes, or custom layouts.
+
+## Pagination triggers
+
+Be careful with `.onAppear` inside rows. It can fire many times during scrolling, navigation, cell reuse-like behavior, and view reconstruction.
+
+Risky:
+
+```swift
+.onAppear {
+    if row == rows.last {
+        Task { await model.loadNextPage() }
+    }
+}
+```
+
+Guard pagination explicitly:
+
+```swift
+.onAppear {
+    guard model.shouldLoadNextPage(afterAppearing: row.id) else { return }
+    Task { await model.loadNextPage() }
+}
+```
+
+A pagination trigger should check that the row is close enough to the end, a next page exists, a page load is not already running, the same request has not already been fired, and the trigger still matches the current query/filter/sort state.
+
+For button-based pagination, keep the button state explicit:
+
+```swift
+Button("Load more") { Task { await model.loadNextPage() } }
+    .disabled(model.pagination.isLoading || !model.pagination.hasNextPage)
+```
+
+## Background work and UI headroom
+
+Moving data preparation off the main actor can help, but it does not make the work free.
+
+Good candidates for background preparation include mapping network responses to render models, formatting large row batches, sorting, grouping, filtering, image resizing or decoding when safe, and cache lookups that do not require main-actor state.
+
+Apply compact final state updates on the main actor.
+
+Do not saturate all CPU cores during scrolling. Aggressive background work can still hurt responsiveness if it competes with UI rendering.
+
+## Validation
+
+Do not call a list optimization successful without a before/after validation path.
+
+For scroll hitches, reproduce the same scroll path and use Animation Hitches, Core Animation, Time Profiler, or the SwiftUI instrument. Check whether the main thread is blocked and whether the cost is row body work, layout, drawing, image work, or repeated collection transforms.
+
+For pagination append hitches:
+
+1. 1Start with a known number of existing rows.
+2. 2Trigger pagination by button tap or near-end scroll.
+3. 3Signpost: pagination triggered, request started, response received, render models built, page appended to state, first new row visible.
+4. 4In Time Profiler, inspect the main thread during the append window.
+5. 5Compare flat append with stable page/section append using the same scenario.
+
+Useful Time Profiler call tree settings:
+
+- Separate by Thread;
+- Invert Call Tree;
+- Hide System Libraries.
+
+Look for app-specific work first: row initializers, row `body` work, formatter creation, sorting/filtering/grouping, render model rebuilding, image preparation, closure/action builders, and custom layout code.
+
+Use the SwiftUI instrument when available to inspect body invocation count, body invocation duration, views updating more often than expected, list rows recomputed during append/filter/sort, and broad invalidation after unrelated state changes.
+
+Use Allocations when the symptom suggests repeated temporary arrays, repeated strings, formatter creation, rebuilding large render-model arrays, per-row type erasure, or large copy-on-write structures copied during rendering.
+
+Temporary probes such as `Self._printChanges()`, row body counters, pagination trigger logs, and render model duration logs can help during investigation. Remove debug probes before shipping.
+
+## Common mistakes
+
+- Replacing `List` with `LazyVStack` without identifying the actual bottleneck.
+- Using `VStack` for long dynamic content.
+- Using index-based identity for rows that can move, be inserted, or be deleted.
+- Using `UUID()` or computed UUIDs as row identity.
+- Sorting, filtering, grouping, formatting, or chunking inside `body`.
+- Appending pages to one flat array when profiling shows broad update work and expensive rows.
+- Creating page sections by chunking a flat array during rendering.
+- Treating `Section` as a guaranteed performance fix instead of a stable pagination boundary to validate.
+- Building heavy swipe actions, menus, custom bindings, or closures for every row without checking row cost.
+- Placing `GeometryReader` or preference-key feedback inside every row.
+- Starting unguarded pagination loads from `.onAppear`.
+- Saturating the CPU with background processing while the user is scrolling.
+- Claiming a frame-rate or millisecond improvement without a trace, log, benchmark, or user-provided measurement.
