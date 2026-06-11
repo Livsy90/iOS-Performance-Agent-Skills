@@ -1,101 +1,119 @@
 # Async Lifecycle and MainActor
 
-Use this reference when reviewing SwiftUI code that involves `.task(id:)`, `.task`, `.onAppear`, row lifecycle callbacks, duplicate loading, pagination triggers, cancellation, unstructured `Task`, `Task.detached`, `MainActor`, or heavy work during UI updates.
+Use this reference when reviewing SwiftUI code that starts or coordinates async work from `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row lifecycle callbacks, explicit user actions, or UI-facing view models.
 
-## Core Principle
+Use it for SwiftUI-specific lifecycle risks: duplicate loading, unstable task restarts, stale result commits, cancellation before UI updates, row-driven pagination triggers, and heavy work accidentally running on the main actor.
 
-Async work in SwiftUI should have a clear lifecycle boundary, a stable trigger, cooperative cancellation, and a narrow final UI update.
+Do not use this file as the primary guide for general actor design, task groups, continuations, `AsyncSequence` producer cleanup, executor internals, or Swift runtime costs. Route those topics to the dedicated Swift Concurrency references. This file is about how async work interacts with SwiftUI view lifetime and UI responsiveness.
 
-The agent should optimize for:
+## Contents
 
-- no side effects during `body` evaluation
-- predictable task start and restart behavior
-- idempotent loading operations
-- cancellation-aware state commits
-- minimal heavy work on the main actor
-- local, compact state mutations after async work completes
+- [Core model](#core-model)
+- [Review workflow](#review-workflow)
+- [Choose the right lifecycle trigger](#choose-the-right-lifecycle-trigger)
+- [Never start async work from `body`](#never-start-async-work-from-body)
+- [Use `.task(id:)` for semantic restarts](#use-taskid-for-semantic-restarts)
+- [Use `.task` without `id` for one lifecycle run](#use-task-without-id-for-one-lifecycle-run)
+- [Use `.onAppear` narrowly](#use-onappear-narrowly)
+- [Row lifecycle and pagination](#row-lifecycle-and-pagination)
+- [Cancellation and stale commits](#cancellation-and-stale-commits)
+- [MainActor work](#mainactor-work)
+- [Batch UI state updates](#batch-ui-state-updates)
+- [Search, filters, and debounce](#search-filters-and-debounce)
+- [Long-lived streams](#long-lived-streams)
+- [Validation](#validation)
+- [Review checklist](#review-checklist)
+- [Common mistakes](#common-mistakes)
+- [Agent response guidance](#agent-response-guidance)
 
-Do not describe async lifecycle issues as generic SwiftUI slowness. Explain which task starts, what causes it to restart, whether it can duplicate work, and where the main actor is doing too much.
+## Core model
 
-## 1. Never Start Work From `body` Evaluation
+Async SwiftUI code should have:
 
-`body` can be evaluated many times. Creating async work during `body` evaluation can start duplicate tasks, race with state updates, and make rendering produce side effects.
+- a clear lifecycle boundary;
+- a stable semantic trigger;
+- idempotent loading behavior;
+- cooperative cancellation;
+- stale-result protection;
+- minimal heavy work on the main actor;
+- compact final UI state mutation.
+
+Do not call the issue generic SwiftUI slowness. Explain which task starts, what causes it to restart, whether duplicate work can happen, whether an old result can overwrite a newer one, and whether the main actor is doing too much work.
+
+## Review workflow
+
+1. 1Identify the user-visible symptom: delayed loading, duplicate calls, stale content, typing lag, scrolling hitch, repeated pagination, or delayed interaction.
+2. 2Find the trigger that starts work: `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row callback, button action, timer, stream, or model method.
+3. 3Check whether the trigger is stable and semantic.
+4. 4Check whether the operation is idempotent.
+5. 5Check cancellation before committing visible state.
+6. 6Check whether older tasks can commit after newer tasks.
+7. 7Separate UI state mutation from CPU-heavy parsing, filtering, sorting, formatting, or render-model generation.
+8. 8Recommend the smallest lifecycle or isolation refactor.
+9. 9Provide a validation path when performance or duplicate work is only suspected.
+
+## Choose the right lifecycle trigger
+
+Prefer triggers that match the lifetime of the work:
+
+- `.task(id:)` — work belongs to the view and restarts for a semantic input.
+- `.task` — work runs once for the current view identity.
+- `.refreshable` — user-initiated pull-to-refresh.
+- Button/action closures — explicit user-initiated operations.
+- `.onAppear` — appearance side effects, not default async loading.
+- Model-owned task — work intentionally outlives one view appearance.
+
+A trigger should not restart because of incidental rendering, random IDs, timestamps, or values that the task itself mutates.
+
+## Never start async work from `body`
+
+`body` can be evaluated many times. Starting async work during body evaluation turns rendering into a side-effect source and can create duplicate tasks.
 
 Risky:
 
 ```swift
-struct AccountSummaryView: View {
-    let model: AccountSummaryModel
+var body: some View {
+    let _ = Task { await model.refresh() }
+    AccountSummaryContent(state: model.state)
+}
+```
 
-    var body: some View {
-        let _ = Task {
-            await model.refresh()
+Prefer a lifecycle modifier or explicit action:
+
+```swift
+var body: some View {
+    AccountSummaryContent(state: model.state)
+        .task(id: accountID) {
+            await model.load(accountID: accountID)
         }
-
-        AccountSummaryContent(model: model)
-    }
 }
 ```
 
-Prefer a lifecycle modifier or an explicit user action:
+## Use `.task(id:)` for semantic restarts
+
+Use `.task(id:)` when work should cancel and restart for a meaningful input:
+
+- entity ID;
+- selected tab;
+- search query;
+- filter or sort option;
+- currently selected account, chat, document, or route.
+
+Good:
 
 ```swift
-struct AccountSummaryView: View {
-    let accountID: Account.ID
-    let model: AccountSummaryModel
-
-    var body: some View {
-        AccountSummaryContent(model: model)
-            .task(id: accountID) {
-                await model.load(accountID: accountID)
-            }
-    }
+.task(id: transactionID) {
+    await model.load(transactionID: transactionID)
 }
 ```
 
-Use `.task(id:)` when the async work belongs to the view lifecycle and should restart when a meaningful input changes.
-
-## 2. Use `.task(id:)` for Lifecycle-Bound Async Work
-
-Use `.task(id:)` when work should:
-
-- start with the view lifecycle
-- cancel when the view disappears or changes identity
-- restart when a specific semantic input changes
-
-Good candidates:
-
-- loading details for `accountID`
-- applying a search query
-- fetching content for a selected tab
-- refreshing data when a filter changes
-- starting a time-limited async subscription for the current entity
-
-Example:
+Risky:
 
 ```swift
-struct TransactionDetailsView: View {
-    let transactionID: Transaction.ID
-    let model: TransactionDetailsModel
-
-    var body: some View {
-        TransactionDetailsContent(state: model.state)
-            .task(id: transactionID) {
-                await model.load(transactionID: transactionID)
-            }
-    }
-}
+.task(id: UUID()) { await model.reload() }
 ```
 
-Avoid unstable IDs:
-
-```swift
-.task(id: UUID()) {
-    await model.reload()
-}
-```
-
-Avoid using an ID that changes as a side effect of the task itself:
+Risky:
 
 ```swift
 .task(id: model.lastRefreshDate) {
@@ -103,32 +121,15 @@ Avoid using an ID that changes as a side effect of the task itself:
 }
 ```
 
-If `refresh()` updates `lastRefreshDate`, the trigger may cause unnecessary restarts.
+If `refresh()` updates `lastRefreshDate`, the task can restart for its own side effect. Prefer a stable semantic input or an explicit user action.
 
-Prefer a stable semantic trigger:
+## Use `.task` without `id` for one lifecycle run
 
-```swift
-.task(id: filter) {
-    await model.apply(filter: filter)
-}
-```
-
-## 3. Use `.task` Without `id` Only for One Lifecycle Run
-
-Use `.task` without `id` when the work should run for the current view identity and should not restart for changing inputs.
-
-Example:
+Use `.task` without `id` when work should run for the current view identity and should not restart for changing inputs.
 
 ```swift
-struct WelcomeView: View {
-    let model: WelcomeModel
-
-    var body: some View {
-        WelcomeContent(state: model.state)
-            .task {
-                await model.loadInitialContentIfNeeded()
-            }
-    }
+.task {
+    await model.loadInitialContentIfNeeded()
 }
 ```
 
@@ -136,52 +137,44 @@ The model method should still be idempotent:
 
 ```swift
 @MainActor
-final class WelcomeModel {
-    private var didLoad = false
-    private(set) var state: WelcomeState = .idle
+func loadInitialContentIfNeeded() async {
+    guard !didLoad else { return }
+    didLoad = true
 
-    func loadInitialContentIfNeeded() async {
-        guard !didLoad else { return }
-        didLoad = true
-
-        state = .loading
-        do {
-            let content = try await service.loadWelcomeContent()
-            try Task.checkCancellation()
-            state = .loaded(content)
-        } catch is CancellationError {
-            state = .idle
-        } catch {
-            state = .failed(error)
-        }
+    state = .loading
+    do {
+        let content = try await service.loadWelcomeContent()
+        try Task.checkCancellation()
+        state = .loaded(content)
+    } catch is CancellationError {
+        state = .idle
+    } catch {
+        state = .failed(error)
     }
 }
 ```
 
-Idempotency matters because SwiftUI view identity can change during navigation, conditional rendering, or parent restructuring.
+Idempotency matters because SwiftUI identity can change during navigation, conditional rendering, parent restructuring, or explicit `.id` boundaries.
 
-## 4. Use `.onAppear` for Appearance Side Effects, Not Default Loading
+## Use `.onAppear` narrowly
 
-`.onAppear` is useful for synchronous or appearance-related side effects:
+Use `.onAppear` for appearance-related side effects:
 
-- analytics exposure events
-- starting an animation flag
-- focusing a field after a view appears
-- notifying a parent that a child became visible
+- analytics exposure events;
+- starting a local animation flag;
+- focusing a field after appearance;
+- notifying a parent that a child became visible;
+- lightweight UI-only effects.
 
-Do not use `.onAppear` as the default async loading mechanism when `.task` or `.task(id:)` better expresses lifecycle and cancellation.
+Do not use `.onAppear { Task { ... } }` as the default loading pattern when `.task` expresses lifecycle and cancellation better.
 
 Risky:
 
 ```swift
 .onAppear {
-    Task {
-        await model.load()
-    }
+    Task { await model.load() }
 }
 ```
-
-This creates an unstructured task that is not automatically tied to the view's task modifier lifecycle.
 
 Prefer:
 
@@ -191,724 +184,243 @@ Prefer:
 }
 ```
 
-If `.onAppear` must start async work, store and cancel the task when appropriate:
+If `.onAppear` must own async work, store the `Task` handle and cancel it in `.onDisappear`. Prefer `.task` when manual ownership is not required.
+
+## Row lifecycle and pagination
+
+Rows in `List`, `LazyVStack`, and lazy containers can appear multiple times during scrolling, navigation, refresh, filtering, and identity changes. A row `.onAppear` is not a reliable “first time visible” event.
+
+Risky:
 
 ```swift
-struct ExportStatusView: View {
-    @State private var pollingTask: Task<Void, Never>?
-    let model: ExportStatusModel
-
-    var body: some View {
-        ExportStatusContent(state: model.state)
-            .onAppear {
-                pollingTask = Task {
-                    await model.pollStatus()
-                }
-            }
-            .onDisappear {
-                pollingTask?.cancel()
-                pollingTask = nil
-            }
+.onAppear {
+    if row.id == model.rows.last?.id {
+        Task { await model.loadNextPage() }
     }
-}
-```
-
-Prefer `.task` for this pattern when manual task ownership is not required.
-
-## 5. Row Lifecycle Callbacks Can Fire Often
-
-Rows in `List`, `LazyVStack`, and other lazy containers can appear more than once during scrolling, navigation, refreshes, filtering, and view identity changes.
-
-Avoid assuming row `.onAppear` means "the row appeared for the first time".
-
-Risky pagination trigger:
-
-```swift
-List(model.rows) { row in
-    ActivityRow(row: row)
-        .onAppear {
-            if row.id == model.rows.last?.id {
-                Task {
-                    await model.loadNextPage()
-                }
-            }
-        }
 }
 ```
 
 Problems:
 
-- row appearance may happen multiple times
-- the task is unstructured
-- the model may start duplicate page loads
-- the last row may disappear and reappear during layout changes
-- a slow earlier request can race with a later one
+- row appearance can repeat;
+- the task is unstructured;
+- duplicate page loads are possible;
+- slow older requests can race with newer requests;
+- layout changes can re-trigger the last row.
 
-Prefer an idempotent model method and a stable prefetch boundary:
+Prefer a stable prefetch boundary and an idempotent model method:
 
 ```swift
-List(model.rows) { row in
-    ActivityRow(row: row)
-        .task(id: row.id) {
-            guard model.shouldPrefetch(after: row.id) else { return }
-            await model.loadNextPageIfNeeded(trigger: row.id)
-        }
+.task(id: row.id) {
+    guard model.shouldPrefetch(after: row.id) else { return }
+    await model.loadNextPageIfNeeded(trigger: row.id)
 }
 ```
 
-Then guard the actual load in the model:
+The model should guard:
 
-```swift
-@MainActor
-final class ActivityFeedModel {
-    private var isLoadingNextPage = false
-    private var loadedPageNumbers: Set<Int> = []
+- already loading;
+- `nextPage != nil` or `hasMore`;
+- already requested page keys;
+- refresh and pagination overlap;
+- cancellation before committing rows;
+- stale trigger IDs when needed.
 
-    var rows: [ActivityRowModel] = []
-    var nextPage: Int? = 1
+For very large lists, prefer a footer or sentinel view so every row does not create its own lifecycle task.
 
-    func shouldPrefetch(after rowID: ActivityRowModel.ID) -> Bool {
-        rows.suffix(5).contains { $0.id == rowID }
-    }
+## Cancellation and stale commits
 
-    func loadNextPageIfNeeded(trigger rowID: ActivityRowModel.ID) async {
-        guard shouldPrefetch(after: rowID) else { return }
-        guard !isLoadingNextPage else { return }
-        guard let page = nextPage else { return }
-        guard !loadedPageNumbers.contains(page) else { return }
+Cancellation is cooperative. It marks a task as canceled, but work may continue until it observes cancellation.
 
-        isLoadingNextPage = true
-        defer { isLoadingNextPage = false }
-
-        do {
-            let response = try await service.loadPage(page)
-            try Task.checkCancellation()
-
-            loadedPageNumbers.insert(page)
-            nextPage = response.nextPage
-            rows.append(contentsOf: response.items.map(ActivityRowModel.init))
-        } catch is CancellationError {
-            // Ignore view-lifecycle cancellation.
-        } catch {
-            // Store an error state if the UI needs to show retry.
-        }
-    }
-}
-```
-
-For very large lists, consider moving the pagination trigger to a footer or sentinel view so every row does not create its own lifecycle task.
-
-## 6. Pagination Loads Must Be Idempotent
-
-The agent should flag pagination code that lacks guards for:
-
-- `isLoading`
-- `hasMore` or `nextPage != nil`
-- already requested page keys
-- stale trigger IDs
-- cancellation before committing results
-- duplicate refresh and pagination overlap
-
-Risky:
-
-```swift
-@MainActor
-func loadNextPage() async {
-    let response = try? await service.loadPage(nextPage)
-    rows.append(contentsOf: response?.items.map(ActivityRowModel.init) ?? [])
-    nextPage += 1
-}
-```
-
-Prefer:
-
-```swift
-@MainActor
-func loadNextPageIfNeeded() async {
-    guard !isLoadingNextPage else { return }
-    guard let page = nextPage else { return }
-
-    isLoadingNextPage = true
-    defer { isLoadingNextPage = false }
-
-    do {
-        let response = try await service.loadPage(page)
-        try Task.checkCancellation()
-
-        rows.append(contentsOf: response.items.map(ActivityRowModel.init))
-        nextPage = response.nextPage
-    } catch is CancellationError {
-        // Cancellation is expected when the view disappears or the trigger changes.
-    } catch {
-        pageLoadError = error
-    }
-}
-```
-
-For refresh plus pagination, prevent overlapping state commits:
-
-```swift
-@MainActor
-func refresh() async {
-    guard !isRefreshing else { return }
-
-    isRefreshing = true
-    nextPage = nil
-    defer { isRefreshing = false }
-
-    do {
-        let response = try await service.loadFirstPage()
-        try Task.checkCancellation()
-
-        rows = response.items.map(ActivityRowModel.init)
-        nextPage = response.nextPage
-    } catch is CancellationError {
-        // Leave existing content if cancellation should not clear the screen.
-    } catch {
-        refreshError = error
-    }
-}
-
-@MainActor
-func loadNextPageIfNeeded() async {
-    guard !isRefreshing else { return }
-    guard !isLoadingNextPage else { return }
-    guard let page = nextPage else { return }
-
-    // Continue page loading.
-}
-```
-
-## 7. Cancellation Is Cooperative
-
-Cancellation marks a task as canceled; it does not forcibly stop every operation immediately.
-
-The agent should check whether long-running work:
-
-- observes cancellation
-- avoids committing stale results after cancellation
-- handles `CancellationError` separately from real failures
-- cancels child tasks or stored task handles when manual ownership is used
-
-Risky:
+Check cancellation before committing visible state:
 
 ```swift
 @MainActor
 func search(query: String) async {
     state = .loading
-
     do {
         let results = try await service.search(query)
+        try Task.checkCancellation()
         state = .loaded(results)
+    } catch is CancellationError {
+        // A newer query or view disappearance canceled this task.
     } catch {
         state = .failed(error)
     }
 }
 ```
 
-Better:
+When an old task can finish after a newer one, also validate the active input before committing:
 
 ```swift
-@MainActor
-func search(query: String) async {
-    state = .loading
-
-    do {
-        let results = try await service.search(query)
-        try Task.checkCancellation()
-        state = .loaded(results)
-    } catch is CancellationError {
-        // Do not show cancellation as a user-facing error.
-    } catch {
-        state = .failed(error)
-    }
-}
+try Task.checkCancellation()
+guard activeAccountID == accountID else { return }
+state = .loaded(details)
 ```
 
-For CPU-bound loops, check cancellation inside the loop:
+Use stale-commit protection for search, fast filter changes, tab switching, navigation details, and pagination.
+
+## MainActor work
+
+A `@MainActor` view model is often a good fit for SwiftUI-facing state. The problem is not UI isolation itself; the problem is doing large synchronous work while isolated to the main actor.
+
+Risky inside a `@MainActor` model during a user interaction:
 
 ```swift
-func buildRows(from items: [Transaction]) async throws -> [TransactionRowModel] {
-    var rows: [TransactionRowModel] = []
-    rows.reserveCapacity(items.count)
-
-    for item in items {
-        try Task.checkCancellation()
-        rows.append(TransactionRowModel(item))
-    }
-
-    return rows
-}
+rows = response.entries
+    .sorted { $0.date > $1.date }
+    .map(StatementRowModel.init)
 ```
 
-## 8. Search and Filter Tasks Should Cancel Older Work
-
-For async search, `.task(id:)` can express restart-on-query-change behavior.
-
-Example with debounce:
+Prefer preparing render-ready data away from main-actor UI mutation when the data is safe to transfer:
 
 ```swift
-struct SearchResultsView: View {
-    @State private var query = ""
-    let model: SearchResultsModel
-
-    var body: some View {
-        VStack {
-            TextField("Search", text: $query)
-            SearchResultsContent(state: model.state)
-        }
-        .task(id: query) {
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                await model.clearResults()
-                return
-            }
-
-            do {
-                try await Task.sleep(for: .milliseconds(300))
-                try Task.checkCancellation()
-                await model.search(query: trimmed)
-            } catch is CancellationError {
-                // A newer query replaced this one.
-            } catch {
-                await model.handleSearchError(error)
-            }
-        }
-    }
-}
+let response = try await service.loadStatement()
+let preparedRows = try await rowBuilder.makeRows(from: response.entries)
+try Task.checkCancellation()
+rows = preparedRows
 ```
 
-Do not debounce by storing many independent `Task` values unless manual ownership is required.
+Keep UI state mutation on `MainActor`. Move pure, CPU-heavy parsing, sorting, filtering, formatting, and render-model generation out of the main-actor update path when it is safe and meaningful.
 
-## 9. `Task` Is Not a Background-Thread Escape Hatch
+Do not assume `Task { ... }` is a background-thread escape hatch. A task created from a main-actor context may still execute main-actor-isolated work.
 
-Creating `Task { ... }` from SwiftUI or from a `@MainActor` context does not automatically make heavy work safe for UI responsiveness.
+Use `Task.detached` sparingly. It requires clear `Sendable` boundaries and should not be the default fix for slow UI.
+
+## Batch UI state updates
+
+Repeated main-actor state updates can invalidate visible SwiftUI views repeatedly.
 
 Risky:
 
 ```swift
-@MainActor
-func applyFilter(_ filter: Filter) {
-    Task {
-        let rows = allItems
-            .filter { $0.matches(filter) }
-            .map(TransactionRowModel.init)
-
-        self.rows = rows
-    }
+for item in items {
+    rows.append(await importer.importRow(item))
 }
 ```
-
-This may still run heavy transformation work in a main-actor context.
-
-Prefer moving pure transformation work outside the main actor when the data is safe to send across concurrency boundaries:
-
-```swift
-@MainActor
-func applyFilter(_ filter: Filter) async {
-    let snapshot = allItems
-
-    do {
-        let rows = try await rowBuilder.buildRows(
-            from: snapshot,
-            filter: filter
-        )
-
-        try Task.checkCancellation()
-        self.rows = rows
-    } catch is CancellationError {
-        // Ignore stale filter work.
-    } catch {
-        self.error = error
-    }
-}
-```
-
-Where the worker is not main-actor isolated:
-
-```swift
-struct TransactionRowBuilder: Sendable {
-    func buildRows(
-        from items: [Transaction],
-        filter: Filter
-    ) async throws -> [TransactionRowModel] {
-        var rows: [TransactionRowModel] = []
-        rows.reserveCapacity(items.count)
-
-        for item in items where item.matches(filter) {
-            try Task.checkCancellation()
-            rows.append(TransactionRowModel(item))
-        }
-
-        return rows
-    }
-}
-```
-
-Use `Task.detached` sparingly. It does not inherit actor isolation in the same way as ordinary tasks and requires careful `Sendable` boundaries. It is not the default fix for slow UI.
-
-## 10. Keep MainActor State Mutations Compact
-
-A `@MainActor` view model is often a good fit for SwiftUI state, but it should not perform large synchronous transformations on the main actor during user interactions.
-
-Risky:
-
-```swift
-@MainActor
-final class StatementModel {
-    var rows: [StatementRowModel] = []
-
-    func apply(response: StatementResponse) {
-        rows = response.entries
-            .sorted { $0.date > $1.date }
-            .map { entry in
-                StatementRowModel(
-                    id: entry.id,
-                    title: entry.title,
-                    amountText: CurrencyFormatter.shared.string(from: entry.amount),
-                    dateText: DateFormatter.shared.string(from: entry.date)
-                )
-            }
-    }
-}
-```
-
-Prefer preparing render-ready data outside the main actor, then applying one compact state update:
-
-```swift
-@MainActor
-final class StatementModel {
-    var rows: [StatementRowModel] = []
-    private let rowBuilder: StatementRowBuilder
-
-    func load() async {
-        do {
-            let response = try await service.loadStatement()
-            let preparedRows = try await rowBuilder.makeRows(from: response.entries)
-            try Task.checkCancellation()
-            rows = preparedRows
-        } catch is CancellationError {
-            // Ignore lifecycle cancellation.
-        } catch {
-            // Update error state if needed.
-        }
-    }
-}
-```
-
-The exact boundary depends on the app architecture. The important rule is to avoid doing large CPU-bound work as part of UI update handling.
-
-## 11. Prefer Type Isolation Over Repeated `MainActor.run`
-
-Repeated `MainActor.run` calls can hide isolation design problems and fragment the update path.
-
-Risky:
-
-```swift
-func load() async {
-    await MainActor.run { state = .loading }
-
-    do {
-        let response = try await service.load()
-        await MainActor.run { title = response.title }
-        await MainActor.run { rows = response.items.map(RowModel.init) }
-        await MainActor.run { state = .loaded }
-    } catch {
-        await MainActor.run { state = .failed(error) }
-    }
-}
-```
-
-Prefer isolating the UI-facing model and applying compact updates:
-
-```swift
-@MainActor
-final class DashboardModel {
-    var state: DashboardState = .idle
-
-    func load() async {
-        state = .loading
-
-        do {
-            let response = try await service.loadDashboard()
-            let rows = try await rowBuilder.makeRows(from: response.items)
-            try Task.checkCancellation()
-            state = .loaded(rows)
-        } catch is CancellationError {
-            state = .idle
-        } catch {
-            state = .failed(error)
-        }
-    }
-}
-```
-
-Use `MainActor.run` for explicit boundary hops when needed, not as a replacement for clear actor isolation.
-
-## 12. Avoid Stale Result Commits
-
-When a task depends on an input, an old task can complete after a newer one. `.task(id:)` helps by canceling the old task, but cancellation is cooperative, so stale result protection may still be needed.
-
-Risky:
-
-```swift
-@MainActor
-func load(accountID: Account.ID) async {
-    let details = try? await service.loadDetails(accountID: accountID)
-    state = details.map(AccountState.loaded) ?? .failed
-}
-```
-
-Prefer checking cancellation and/or validating the active input before committing:
-
-```swift
-@MainActor
-final class AccountDetailsModel {
-    private var activeAccountID: Account.ID?
-    var state: AccountDetailsState = .idle
-
-    func load(accountID: Account.ID) async {
-        activeAccountID = accountID
-        state = .loading
-
-        do {
-            let details = try await service.loadDetails(accountID: accountID)
-            try Task.checkCancellation()
-            guard activeAccountID == accountID else { return }
-            state = .loaded(details)
-        } catch is CancellationError {
-            // A new account or view disappearance canceled this load.
-        } catch {
-            guard activeAccountID == accountID else { return }
-            state = .failed(error)
-        }
-    }
-}
-```
-
-Use this especially for search, tab switching, navigation detail screens, and fast-changing filters.
-
-## 13. Avoid Updating State Too Frequently During Async Work
-
-Repeated main-actor state updates can cause unnecessary view invalidation.
-
-Risky:
-
-```swift
-@MainActor
-func importItems(_ items: [ImportItem]) async {
-    rows.removeAll()
-
-    for item in items {
-        let row = await importer.importRow(item)
-        rows.append(row)
-    }
-}
-```
-
-This can invalidate the UI once per item.
 
 Prefer batching when the UI does not need per-item progress:
 
 ```swift
-@MainActor
-func importItems(_ items: [ImportItem]) async {
+let importedRows = try await importer.importRows(items)
+try Task.checkCancellation()
+rows = importedRows
+```
+
+If progress is required, update a lightweight progress value, coalesce updates, or throttle updates instead of rebuilding the full visible collection on every item.
+
+## Search, filters, and debounce
+
+For async search, `.task(id:)` can express restart-on-query-change behavior.
+
+```swift
+.task(id: query) {
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        await model.clearResults()
+        return
+    }
+
     do {
-        let importedRows = try await importer.importRows(items)
+        try await Task.sleep(for: .milliseconds(300))
         try Task.checkCancellation()
-        rows = importedRows
+        await model.search(query: trimmed)
     } catch is CancellationError {
-        // Ignore cancellation or preserve existing rows.
+        // A newer query replaced this one.
     } catch {
-        error = error
+        await model.handleSearchError(error)
     }
 }
 ```
 
-If progress is needed, throttle updates or update a lightweight progress value instead of rebuilding the full visible collection on every step.
+Keep debounce, cancellation, and final commit behavior explicit. Do not keep many independent search tasks alive unless manual ownership is required.
 
-## 14. Async Streams and Long-Lived Subscriptions
+## Long-lived streams
 
-When a view consumes an `AsyncSequence`, tie the loop to `.task` so it cancels with the view lifecycle.
-
-Example:
+When a view consumes an `AsyncSequence`, tie the consuming loop to a lifecycle boundary so it cancels when the view disappears.
 
 ```swift
-struct PriceTickerView: View {
-    let model: PriceTickerModel
-
-    var body: some View {
-        PriceTickerContent(prices: model.prices)
-            .task {
-                await model.observePrices()
-            }
-    }
+.task {
+    await model.observePrices()
 }
 ```
 
-Model:
+For high-frequency streams, do not update full UI state for every event unless the UI needs that frequency. Coalesce, throttle, diff, or update only changed values.
 
-```swift
-@MainActor
-final class PriceTickerModel {
-    var prices: [PriceRowModel] = []
-    private let priceStream: PriceStream
+Keep producer lifetime, buffering, and `onTermination` details in the dedicated `AsyncSequence` reference. In this file, focus on the SwiftUI consumer lifetime and UI update frequency.
 
-    func observePrices() async {
-        do {
-            for try await snapshot in priceStream.snapshots() {
-                try Task.checkCancellation()
-                prices = snapshot.map(PriceRowModel.init)
-            }
-        } catch is CancellationError {
-            // Expected when the view disappears.
-        } catch {
-            // Store stream error if visible to the user.
-        }
-    }
-}
-```
+## Validation
 
-For high-frequency streams, avoid updating full UI state for every event. Coalesce, throttle, diff, or update only the visible/changed values when possible.
+Use validation when the issue is not obvious from code or when claiming a performance improvement.
 
-## 15. Error Handling Should Treat Cancellation Separately
+Good validation options:
 
-Cancellation is often a normal lifecycle event, not a user-facing failure.
+- log task start, cancellation, completion, and commit events;
+- count duplicate network calls for the same semantic input;
+- add signposts around user action, request start, response arrival, render-model build, and final state commit;
+- use Time Profiler to see whether heavy transformation work runs on the main thread during interaction;
+- use the SwiftUI instrument to inspect repeated body updates after async commits;
+- use Animation Hitches when the symptom is visible stutter;
+- use XCTest performance tests for isolated row-building, filtering, sorting, or formatting pipelines;
+- use MetricKit or production logs to detect repeated hangs or slow interactions.
 
-Risky:
+Separate static review risks from measured results. Do not claim a numeric cost unless the user provided measurements or a trace/log/benchmark supports it.
 
-```swift
-catch {
-    state = .failed(error)
-}
-```
+## Review checklist
 
-Prefer:
+Check:
 
-```swift
-catch is CancellationError {
-    // Expected lifecycle cancellation.
-} catch {
-    state = .failed(error)
-}
-```
+- Is work started from `body`?
+- Is `.task(id:)` using a stable semantic ID?
+- Does the task mutate the same value used as its ID?
+- Is `.task` without `id` guarded by an idempotent model method?
+- Is `.onAppear` used only where repeated appearance is acceptable or guarded?
+- Can row lifecycle callbacks start duplicate work?
+- Are pagination loads guarded by loading state, next-page state, and requested-page tracking?
+- Can refresh and pagination commit conflicting state?
+- Is cancellation handled separately from real errors?
+- Is cancellation checked before visible state commits?
+- Can an older result overwrite a newer result?
+- Is heavy transformation work accidentally running on the main actor?
+- Are UI state mutations compact and batched?
+- Is `Task {}` being used as a fake background queue?
+- Is `Task.detached` avoided unless isolation and `Sendable` boundaries are explicit?
+- Are high-frequency streams coalesced before updating UI?
 
-Only show cancellation to the user when cancellation was explicitly user-initiated and the product wants visible feedback.
+## Common mistakes
 
-## 16. Review Checklist
+- Starting `Task {}` during `body` evaluation.
+- Using `.task(id: UUID())` or another unstable ID.
+- Using a timestamp or `lastUpdatedAt` as a task ID when the task mutates it.
+- Treating `.onAppear` as a reliable one-time event.
+- Starting pagination from row appearance without duplicate-load guards.
+- Catching cancellation as a normal user-facing error.
+- Committing results after cancellation or after the active input changed.
+- Doing sorting, filtering, parsing, or render-model building on a `@MainActor` hot path.
+- Updating a visible collection once per item when one batched update would work.
+- Assuming `Task {}` automatically moves work off the main actor.
+- Using `Task.detached` without a clear reason and safe data boundary.
 
-When reviewing async lifecycle and main-actor code, check:
+## Agent response guidance
 
-- Is async work started from `.task`, `.task(id:)`, `.refreshable`, an explicit user action, or a controlled model method rather than `body`?
-- Does the task have a stable semantic trigger?
-- Could the trigger restart because the task mutates the same value used as its ID?
-- Is `.onAppear` used only where repeated appearances are acceptable or guarded?
-- Are row lifecycle callbacks idempotent?
-- Can pagination start duplicate requests?
-- Are refresh and pagination prevented from committing conflicting state?
-- Does the code handle cancellation separately from real errors?
-- Is cancellation checked before committing final state?
-- Could an older task overwrite newer state?
-- Is heavy transformation work kept off the main actor when safe?
-- Are main-actor mutations compact and batched?
-- Is `Task {}` being used as an accidental background-thread workaround?
-- Is `Task.detached` avoided unless there is a clear Sendable and isolation boundary?
-- Are high-frequency async streams coalesced or throttled before updating UI?
+When reviewing async SwiftUI code, respond with:
 
-## 17. Common Red Flags
+1. 1The lifecycle trigger that starts the work.
+2. 2Whether the trigger is stable.
+3. 3Whether duplicate work is possible.
+4. 4Whether cancellation and stale commits are handled.
+5. 5Whether heavy work runs on the main actor.
+6. 6The smallest refactor that fixes the issue.
+7. 7A validation step when confirmation is needed.
 
-Flag these patterns:
-
-```swift
-let _ = Task { await model.load() }
-```
-
-inside `body`.
-
-```swift
-.onAppear {
-    Task { await model.load() }
-}
-```
-
-when `.task` would express lifecycle and cancellation better.
-
-```swift
-.task(id: UUID()) { ... }
-```
-
-or any unstable task ID.
-
-```swift
-.task(id: model.lastUpdatedAt) {
-    await model.refresh()
-}
-```
-
-when the task changes the same value that triggers it.
-
-```swift
-.onAppear {
-    if row.id == rows.last?.id {
-        Task { await loadNextPage() }
-    }
-}
-```
-
-without duplicate-load guards.
-
-```swift
-Task {
-    let rows = expensiveMainActorTransformation()
-    self.rows = rows
-}
-```
-
-when created from a main-actor context and assumed to be background work.
-
-```swift
-catch {
-    state = .failed(error)
-}
-```
-
-when cancellation should be ignored or handled separately.
-
-```swift
-for item in items {
-    rows.append(makeRow(item))
-}
-```
-
-when each append invalidates visible UI and batching would be sufficient.
-
-## 18. Agent Guidance
-
-When the agent reviews async SwiftUI code, it should answer with:
-
-1. the lifecycle trigger that starts the work
-2. whether the trigger is stable
-3. whether duplicate work is possible
-4. whether cancellation is handled correctly
-5. whether stale results can commit
-6. whether heavy work runs on the main actor
-7. the smallest refactor that fixes the issue
-8. how to validate the fix if confirmation is needed
-
-Prefer precise statements:
+Prefer precise language:
 
 ```md
-This `.onAppear` can run repeatedly as rows enter and leave the lazy list. The model should make pagination idempotent with `isLoadingNextPage`, `nextPage`, and cancellation checks before committing rows.
+This `.onAppear` can run repeatedly as rows enter and leave the lazy list. Move the trigger to `.task(id:)` or a sentinel view, and make the model method idempotent with `isLoadingNextPage`, `nextPage`, requested-page tracking, and cancellation checks before committing rows.
 ```
 
-Avoid unsupported claims:
+Avoid unsupported claims such as “this definitely causes a 300 ms hitch” unless a trace, signpost, benchmark, or user-provided measurement proves that number.
 
-```md
-This definitely causes a 300 ms hitch.
-```
+## Final rule
 
-Unless a trace, signpost, XCTest result, or user-provided measurement proves it.
-
-## Final Rule
-
-Async lifecycle performance in SwiftUI is mostly about preventing accidental work: duplicate tasks, unstable restarts, stale commits, excessive main-actor transformation, and too many state updates. Make the trigger stable, make the operation idempotent, make cancellation explicit, and keep the final UI mutation small.
+Async lifecycle performance in SwiftUI is mostly about preventing accidental work: duplicate tasks, unstable restarts, stale commits, excessive main-actor transformation, and too many UI state updates. Make the trigger stable, make the operation idempotent, make cancellation explicit, and keep the final UI mutation small.
