@@ -4,9 +4,6 @@
   <img width="280" alt="Image" src="https://github.com/user-attachments/assets/36210daa-63b7-4619-8084-5410ff63bfdd" />
 </p>
 
-<p align="center">
-<img width="500" alt="Image" src="https://github.com/user-attachments/assets/b35e663a-7eea-4cce-a080-bb388406c962" />
-</p>
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
 Each skill lives under the `skills/` directory and can be copied manually into another agent setup if needed.
