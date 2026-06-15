@@ -6,25 +6,25 @@ The goal is not to remove every closure, avoid every custom binding, or make eve
 
 ## Contents
 
-- [Core principle](#core-principle)
-- [Review procedure](#review-procedure)
-- [Stored closures in repeated views](#stored-closures-in-repeated-views)
-- [Capture lists](#capture-lists)
-- [Passing IDs instead of full models](#passing-ids-instead-of-full-models)
-- [Single action router pattern](#single-action-router-pattern)
-- [Gestures, menus, and swipe actions](#gestures-menus-and-swipe-actions)
-- [Custom bindings](#custom-bindings)
-- [Key-path bindings with Observation](#key-path-bindings-with-observation)
-- [Binding red flags](#binding-red-flags)
-- [Equatable views](#equatable-views)
-- [Equatable input rules](#equatable-input-rules)
-- [Equatable and closures](#equatable-and-closures)
-- [Prefer Equatable render models](#prefer-equatable-render-models)
-- [When not to use `.equatable()`](#when-not-to-use-equatable)
-- [Risk levels](#risk-levels)
-- [Suggested refactoring order](#suggested-refactoring-order)
-- [Validation](#validation)
-- [Agent wording](#agent-wording)
+* [Core principle](#core-principle)
+* [Review procedure](#review-procedure)
+* [Stored closures in repeated views](#stored-closures-in-repeated-views)
+* [Capture lists](#capture-lists)
+* [Passing IDs instead of full models](#passing-ids-instead-of-full-models)
+* [Single action router pattern](#single-action-router-pattern)
+* [Gestures, menus, and swipe actions](#gestures-menus-and-swipe-actions)
+* [Custom bindings](#custom-bindings)
+* [Key-path bindings with Observation](#key-path-bindings-with-observation)
+* [Binding red flags](#binding-red-flags)
+* [Equatable views](#equatable-views)
+* [Equatable input rules](#equatable-input-rules)
+* [Equatable and closures](#equatable-and-closures)
+* [Prefer Equatable render models](#prefer-equatable-render-models)
+* [When not to use `.equatable()`](#when-not-to-use-equatable)
+* [Risk levels](#risk-levels)
+* [Suggested refactoring order](#suggested-refactoring-order)
+* [Validation](#validation)
+* [Agent wording](#agent-wording)
 
 ## Core principle
 
@@ -42,15 +42,15 @@ Do not claim that closures automatically cause redraws. Treat closure-heavy code
 
 When reviewing closure-heavy SwiftUI code, check:
 
-1. 1Is the closure part of a small static view or a hot repeated view?
-2. 2Is the closure stored as a property of a visual row?
-3. 3Does the closure capture the whole parent view implicitly?
-4. 4Does the closure capture a large domain value when only an ID is needed?
-5. 5Are multiple non-visual actions mixed into a row that otherwise has simple visual input?
-6. 6Would a key-path binding express the same state relationship more clearly?
-7. 7Does a custom binding hide derived work, formatting, validation, or index-based mutation inside `body`?
-8. 8Is `.equatable()` used only for cheap, complete, visual equality?
-9. 9Could the refactor make update locality clearer without adding unnecessary architecture?
+1. Is the closure part of a small static view or a hot repeated view?
+2. Is the closure stored as a property of a visual row?
+3. Does the closure capture more surrounding context than intended?
+4. Does the closure capture a large domain value when only an ID is needed?
+5. Are multiple non-visual actions mixed into a row that otherwise has simple visual input?
+6. Would a key-path binding express the same state relationship more clearly?
+7. Does a custom binding hide derived work, formatting, validation, or index-based mutation inside `body`?
+8. Is `.equatable()` used only for cheap, complete, visual equality?
+9. Could the refactor make update locality clearer without adding unnecessary architecture?
 
 Do not flag every closure. Closures are normal in SwiftUI. Focus on repeated views, broad captures, unstable behavior inputs, and cases where code structure makes updates harder to reason about.
 
@@ -120,17 +120,24 @@ ForEach(model.payments) { payment in
             model.openPayment(id)
         }
         .swipeActions {
-            Button("Retry") { [model, id = payment.id] in model.retryPayment(id) }
-            Button("Cancel", role: .destructive) { [model, id = payment.id] in model.cancelPayment(id) }
+            Button("Retry") { [model, id = payment.id] in
+                model.retryPayment(id)
+            }
+
+            Button("Cancel", role: .destructive) { [model, id = payment.id] in
+                model.cancelPayment(id)
+            }
         }
 }
 ```
 
-This does not remove closures from the SwiftUI tree. The narrower goal is to keep the row's stored input visual, make row values easier to compare, and avoid accidentally capturing more state than the action needs.
+This does not remove closures from the SwiftUI tree. The gesture and swipe action closures are still built as part of the row subtree. The narrower goal is to keep the row's stored input visual, make row values easier to compare, avoid accidentally capturing more state than the action needs, and create a cleaner equality boundary if the visual row later becomes `Equatable`.
+
+Treat this primarily as a composition and reasoning refactor. Do not claim it improves performance unless before/after evidence confirms that it reduces update work, allocation churn, or body duration in the tested scenario.
 
 ## Capture lists
 
-Closures created inside `body` can accidentally capture the whole parent view value. In repeated content, prefer capture lists that make dependencies explicit and small.
+Closures created inside `body` may capture more surrounding context than intended, including the parent view value or broad model dependencies. In repeated content, prefer capture lists that make dependencies explicit and small.
 
 Risky:
 
@@ -154,18 +161,20 @@ ForEach(model.transfers) { transfer in
 
 Prefer capturing:
 
-- a stable model reference;
-- a stable service or action handler;
-- a stable row ID;
-- a small immutable value needed by the action.
+* a stable model reference;
+* a stable service or action handler;
+* a stable row ID;
+* a small immutable value needed by the action.
 
 Avoid capturing:
 
-- the whole parent view implicitly;
-- a large domain model when only an ID is needed;
-- a mutable row object when identity is enough;
-- a broad handler container when a narrower dependency is available;
-- values recomputed during every render.
+* the whole parent view implicitly;
+* a large domain model when only an ID is needed;
+* a mutable row object when identity is enough;
+* a broad handler container when a narrower dependency is available;
+* values recomputed during every render.
+
+Capture a model reference only when the model is a stable reference type. For value-based state, reducer stores, bindings, or snapshot-style models, make sure the capture does not freeze stale state or bypass the intended mutation path.
 
 Capture lists do not make closures automatically diffable. They reduce accidental captures and make action dependencies easier to audit.
 
@@ -193,7 +202,7 @@ Passing the full model is fine when the action genuinely needs the full immutabl
 
 ## Single action router pattern
 
-When a child must report several interactions to a parent, prefer a compact action surface over many independent closure properties.
+When a child must report several interactions to a parent, a compact action surface can be clearer than many independent closure properties.
 
 ```swift
 enum CardAction {
@@ -218,7 +227,9 @@ struct CardRow: View {
 }
 ```
 
-This still stores a closure, so it is not a magic performance fix. It can reduce API noise and make behavior easier to inspect. For very hot rows, also consider whether actions can be attached outside the purely visual row.
+This still stores a closure, so it is not a magic performance fix. It can reduce API noise and make behavior easier to inspect.
+
+Do not introduce an action enum only because a row has one simple tap action. Use this pattern when a row has several related interactions and the action surface is becoming noisy. For very hot rows, also consider whether actions can be attached outside the purely visual row.
 
 ## Gestures, menus, and swipe actions
 
@@ -226,12 +237,12 @@ Gestures, menus, context menus, and swipe actions are interaction surfaces. In l
 
 Review whether:
 
-- every row really needs the interaction surface;
-- actions capture only stable IDs or narrow dependencies;
-- menu content is lightweight;
-- destructive actions have clear confirmation or state handling;
-- repeated action builders hide expensive work;
-- gesture state is owned locally where possible.
+* every row really needs the interaction surface;
+* actions capture only stable IDs or narrow dependencies;
+* menu content is lightweight;
+* destructive actions have clear confirmation or state handling;
+* repeated action builders hide expensive work;
+* gesture state is owned locally where possible.
 
 Risky:
 
@@ -360,6 +371,8 @@ Binding(
 
 The issue is not the `Binding` type itself. The issue is hidden work, broad captures, index-based mutation risk, or transformation logic running on a hot rendering path.
 
+Index-based bindings are also a correctness risk when the collection can be reordered, filtered, inserted into, or deleted from. Prefer ID-based mutation, bindings produced from stable collection identity, or model methods that validate the item identity before mutating.
+
 ## Equatable views
 
 Use `Equatable` only when a view has clear, cheap, visual inputs and its body is expensive enough to justify the equality check.
@@ -401,19 +414,21 @@ Do not use `.equatable()` as a bandage for broad invalidation. First try to narr
 
 Include in equality:
 
-- all visual values that affect rendering;
-- style flags that change visible output;
-- values that change layout, text, color, images, accessibility labels, or visibility.
+* all visual values that affect rendering;
+* style flags that change visible output;
+* values that change layout, text, color, images, accessibility labels, or visibility.
 
 Avoid including:
 
-- non-visual closures;
-- services;
-- model objects whose internal changes are not represented by the compared values;
-- large arrays when equality is more expensive than recomputing the view;
-- volatile values that change every update.
+* non-visual closures;
+* services;
+* model objects whose internal changes are not represented by the compared values;
+* large arrays when equality is more expensive than recomputing the view;
+* volatile values that change every update.
 
 Do not exclude a value from equality if changing it should visibly update the view.
+
+If the view reads environment values that affect visible output, remember that they are part of the effective visual input even if they are not stored properties in the view initializer. Examples include color scheme, dynamic type size, locale, layout direction, size class, accessibility settings, calendar, and time zone.
 
 Risky:
 
@@ -490,8 +505,13 @@ struct TransactionRow: View, Equatable {
 
     var body: some View {
         HStack {
-            Text(row.title)
+            VStack(alignment: .leading) {
+                Text(row.title)
+                Text(row.subtitle)
+            }
+
             Spacer()
+
             Text(row.amountText)
         }
         .opacity(row.isPending ? 0.6 : 1)
@@ -505,13 +525,14 @@ This works best when the render model is already prepared outside rendering and 
 
 Avoid `.equatable()` when:
 
-- the view body is cheap;
-- equality is expensive;
-- inputs are large collections;
-- the view reads broad external state internally;
-- equality would omit values that affect visible output;
-- the view has hidden dependencies through environment, model references, or custom bindings;
-- the performance issue is actually identity, layout, drawing, async lifecycle, or main-actor work.
+* the view body is cheap;
+* equality is expensive;
+* inputs are large collections;
+* the view reads broad external state internally;
+* the view reads environment values that affect visible output and those dependencies are not obvious;
+* equality would omit values that affect visible output;
+* the view has hidden dependencies through environment, model references, or custom bindings;
+* the performance issue is actually identity, layout, drawing, async lifecycle, or main-actor work.
 
 `Equatable` is a local optimization boundary, not a substitute for good dependency design.
 
@@ -519,36 +540,36 @@ Avoid `.equatable()` when:
 
 Use low risk when:
 
-- a closure appears in a small static view;
-- a custom binding performs a tiny necessary transformation;
-- `.equatable()` is used with complete and cheap visual equality.
+* a closure appears in a small static view;
+* a custom binding performs a tiny necessary transformation;
+* `.equatable()` is used with complete and cheap visual equality.
 
 Use medium risk when:
 
-- repeated rows store several action closures;
-- custom bindings capture a parent model in a large form or list;
-- closure capture lists are missing in a frequently updating parent;
-- `.equatable()` compares multiple values manually and could become incomplete over time.
+* repeated rows store several action closures;
+* custom bindings capture a parent model in a large form or list;
+* closure capture lists are missing in a frequently updating parent;
+* `.equatable()` compares multiple values manually and could become incomplete over time.
 
 Use high risk when:
 
-- row closures capture large mutable models or whole parent views in a large collection;
-- custom bindings perform expensive derived reads or index-based mutations in repeated content;
-- `.equatable()` omits visible state;
-- `.equatable()` is used to hide broad invalidation instead of fixing dependencies;
-- action builders do non-trivial work for every row during rendering.
+* row closures capture large mutable models or whole parent views in a large collection;
+* custom bindings perform expensive derived reads or index-based mutations in repeated content;
+* `.equatable()` omits visible state;
+* `.equatable()` is used to hide broad invalidation instead of fixing dependencies;
+* action builders do non-trivial work for every row during rendering.
 
 ## Suggested refactoring order
 
 For closure, binding, and equatable issues, prefer this order:
 
-1. 1Keep visual row data separate from action behavior.
-2. 2Capture stable IDs and narrow dependencies in closures.
-3. 3Replace unnecessary custom bindings with key-path bindings.
-4. 4Move binding transformation logic out of `body` when it grows.
-5. 5Reduce multiple closure properties to a smaller action surface when useful.
-6. 6Use `Equatable` only after visual inputs are clear and equality is cheap.
-7. 7Validate with profiling or temporary probes only when unnecessary updates remain suspected.
+1. Keep visual row data separate from action behavior.
+2. Capture stable IDs and narrow dependencies in closures.
+3. Replace unnecessary custom bindings with key-path bindings.
+4. Move binding transformation logic out of `body` when it grows.
+5. Reduce multiple closure properties to a smaller action surface when useful.
+6. Use `Equatable` only after visual inputs are clear and equality is cheap.
+7. Validate with profiling or temporary probes only when unnecessary updates remain suspected.
 
 ## Validation
 
@@ -556,11 +577,11 @@ Use validation when the code review is more than a simple readability cleanup or
 
 Useful checks:
 
-- Use the SwiftUI instrument to inspect body invocation count and body duration before and after the refactor.
-- Use Time Profiler when closures, binding getters, action builders, or equality checks appear in a hot path.
-- Use Allocations when the code creates many closure-heavy rows, temporary action models, or custom binding wrappers during repeated updates.
-- Add temporary logs or `_printChanges()` to confirm whether a row updates when unrelated state changes.
-- Add signposts around high-level interactions such as page append, filter change, search text update, or row action presentation.
+* Use the SwiftUI instrument to inspect body invocation count and body duration before and after the refactor.
+* Use Time Profiler when closures, binding getters, action builders, or equality checks appear in a hot path.
+* Use Allocations when the code creates many closure-heavy rows, temporary action models, or custom binding wrappers during repeated updates.
+* Add temporary logs or `_printChanges()` to confirm whether a row updates when unrelated state changes.
+* Add signposts around high-level interactions such as page append, filter change, search text update, or row action presentation.
 
 Do not claim that a closure, binding, or `.equatable()` change improved performance unless there is before/after evidence. Without measurement, present the change as reducing risk, clarifying dependencies, or making update behavior easier to validate.
 
