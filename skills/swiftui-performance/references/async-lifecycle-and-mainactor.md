@@ -42,15 +42,15 @@ Do not call the issue generic SwiftUI slowness. Explain which task starts, what 
 
 ## Review workflow
 
-1. 1Identify the user-visible symptom: delayed loading, duplicate calls, stale content, typing lag, scrolling hitch, repeated pagination, or delayed interaction.
-2. 2Find the trigger that starts work: `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row callback, button action, timer, stream, or model method.
-3. 3Check whether the trigger is stable and semantic.
-4. 4Check whether the operation is idempotent.
-5. 5Check cancellation before committing visible state.
-6. 6Check whether older tasks can commit after newer tasks.
-7. 7Separate UI state mutation from CPU-heavy parsing, filtering, sorting, formatting, or render-model generation.
-8. 8Recommend the smallest lifecycle or isolation refactor.
-9. 9Provide a validation path when performance or duplicate work is only suspected.
+1. Identify the user-visible symptom: delayed loading, duplicate calls, stale content, typing lag, scrolling hitch, repeated pagination, or delayed interaction.
+2. Find the trigger that starts work: `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row callback, button action, timer, stream, or model method.
+3. Check whether the trigger is stable and semantic.
+4. Check whether the operation is idempotent.
+5. Check cancellation before committing visible state.
+6. Check whether older tasks can commit after newer tasks.
+7. Separate UI state mutation from CPU-heavy parsing, filtering, sorting, formatting, or render-model generation.
+8. Recommend the smallest lifecycle or isolation refactor.
+9. Provide a validation path when performance or duplicate work is only suspected.
 
 ## Choose the right lifecycle trigger
 
