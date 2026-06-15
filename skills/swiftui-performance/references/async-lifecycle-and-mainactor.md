@@ -42,15 +42,15 @@ Do not call the issue generic SwiftUI slowness. Explain which task starts, what 
 
 ## Review workflow
 
-1. Identify the user-visible symptom: delayed loading, duplicate calls, stale content, typing lag, scrolling hitch, repeated pagination, or delayed interaction.
-2. Find the trigger that starts work: `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row callback, button action, timer, stream, or model method.
-3. Check whether the trigger is stable and semantic.
-4. Check whether the operation is idempotent.
-5. Check cancellation before committing visible state.
-6. Check whether older tasks can commit after newer tasks.
-7. Separate UI state mutation from CPU-heavy parsing, filtering, sorting, formatting, or render-model generation.
-8. Recommend the smallest lifecycle or isolation refactor.
-9. Provide a validation path when performance or duplicate work is only suspected.
+1. 1Identify the user-visible symptom: delayed loading, duplicate calls, stale content, typing lag, scrolling hitch, repeated pagination, or delayed interaction.
+2. 2Find the trigger that starts work: `.task`, `.task(id:)`, `.refreshable`, `.onAppear`, row callback, button action, timer, stream, or model method.
+3. 3Check whether the trigger is stable and semantic.
+4. 4Check whether the operation is idempotent.
+5. 5Check cancellation before committing visible state.
+6. 6Check whether older tasks can commit after newer tasks.
+7. 7Separate UI state mutation from CPU-heavy parsing, filtering, sorting, formatting, or render-model generation.
+8. 8Recommend the smallest lifecycle or isolation refactor.
+9. 9Provide a validation path when performance or duplicate work is only suspected.
 
 ## Choose the right lifecycle trigger
 
@@ -147,7 +147,8 @@ func loadInitialContentIfNeeded() async {
         try Task.checkCancellation()
         state = .loaded(content)
     } catch is CancellationError {
-        state = .idle
+        // Usually do not commit visible state from a canceled task.
+        // A newer task or view disappearance may have replaced this lifecycle run.
     } catch {
         state = .failed(error)
     }
@@ -155,6 +156,8 @@ func loadInitialContentIfNeeded() async {
 ```
 
 Idempotency matters because SwiftUI identity can change during navigation, conditional rendering, parent restructuring, or explicit `.id` boundaries.
+
+If cancellation should reset visible state, guard that reset with the same semantic input or request token used by the current operation. Otherwise, an older canceled task can overwrite newer visible state.
 
 ## Use `.onAppear` narrowly
 
@@ -226,7 +229,7 @@ The model should guard:
 - cancellation before committing rows;
 - stale trigger IDs when needed.
 
-For very large lists, prefer a footer or sentinel view so every row does not create its own lifecycle task.
+For very large lists, prefer a footer or sentinel view so every row does not create its own lifecycle task. Use row-level `.task(id:)` for pagination only when the guard is cheap and the model fully handles duplicate attempts.
 
 ## Cancellation and stale commits
 
@@ -283,9 +286,11 @@ rows = preparedRows
 
 Keep UI state mutation on `MainActor`. Move pure, CPU-heavy parsing, sorting, filtering, formatting, and render-model generation out of the main-actor update path when it is safe and meaningful.
 
+This only helps when the preparation method is not isolated to the main actor and does not call main-actor-isolated APIs. Extracting code into an `async` function or adding `await` does not automatically move CPU-heavy work off the main actor.
+
 Do not assume `Task { ... }` is a background-thread escape hatch. A task created from a main-actor context may still execute main-actor-isolated work.
 
-Use `Task.detached` sparingly. It requires clear `Sendable` boundaries and should not be the default fix for slow UI.
+Use `Task.detached` sparingly. It creates an unstructured detached top-level task and requires explicit data-transfer boundaries; captured values must be safe to use outside the current actor context. It should not be the default fix for slow UI.
 
 ## Batch UI state updates
 
@@ -384,7 +389,7 @@ Check:
 - Is heavy transformation work accidentally running on the main actor?
 - Are UI state mutations compact and batched?
 - Is `Task {}` being used as a fake background queue?
-- Is `Task.detached` avoided unless isolation and `Sendable` boundaries are explicit?
+- Is `Task.detached` avoided unless isolation and data-transfer boundaries are explicit?
 - Are high-frequency streams coalesced before updating UI?
 
 ## Common mistakes
@@ -399,7 +404,7 @@ Check:
 - Doing sorting, filtering, parsing, or render-model building on a `@MainActor` hot path.
 - Updating a visible collection once per item when one batched update would work.
 - Assuming `Task {}` automatically moves work off the main actor.
-- Using `Task.detached` without a clear reason and safe data boundary.
+- Using `Task.detached` without a clear reason and safe data-transfer boundary.
 
 ## Agent response guidance
 
