@@ -4,20 +4,20 @@ Use this reference when the task involves SwiftUI `List`, `ScrollView`, `LazyVSt
 
 ## Contents
 
-- [Core model](#core-model)
-- [Start from the symptom](#start-from-the-symptom)
-- [Choosing the container](#choosing-the-container)
-- [Stable identity](#stable-identity)
-- [Row cost](#row-cost)
-- [Pagination and update locality](#pagination-and-update-locality)
-- [Do not derive pages inside `body`](#do-not-derive-pages-inside-body)
-- [Filtering, sorting, and formatting](#filtering-sorting-and-formatting)
-- [Row interactions](#row-interactions)
-- [Layout and geometry](#layout-and-geometry)
-- [Pagination triggers](#pagination-triggers)
-- [Background work and UI headroom](#background-work-and-ui-headroom)
-- [Validation](#validation)
-- [Common mistakes](#common-mistakes)
+* [Core model](#core-model)
+* [Start from the symptom](#start-from-the-symptom)
+* [Choosing the container](#choosing-the-container)
+* [Stable identity](#stable-identity)
+* [Row cost](#row-cost)
+* [Pagination and update locality](#pagination-and-update-locality)
+* [Do not derive pages inside `body`](#do-not-derive-pages-inside-body)
+* [Filtering, sorting, and formatting](#filtering-sorting-and-formatting)
+* [Row interactions](#row-interactions)
+* [Layout and geometry](#layout-and-geometry)
+* [Pagination triggers](#pagination-triggers)
+* [Background work and UI headroom](#background-work-and-ui-headroom)
+* [Validation](#validation)
+* [Common mistakes](#common-mistakes)
 
 ## Core model
 
@@ -113,7 +113,18 @@ Use `.id(...)` only for a deliberate identity boundary, such as resetting local 
 
 Rows in large lists should mostly render already prepared values.
 
-Watch for repeated work in row `body`, row initializers, row modifiers, and computed properties read by rows: currency/date formatting, localized string construction, image decoding/resizing, icon lookup, sorting or filtering child data, expensive computed properties, database reads, synchronous file access, long modifier chains, overlays, masks, shadows, and blurs.
+Watch for repeated work in row `body`, row initializers, row modifiers, and computed properties read by rows:
+
+* currency/date formatting;
+* localized string construction;
+* image decoding/resizing;
+* icon lookup;
+* sorting or filtering child data;
+* expensive computed properties;
+* database reads;
+* synchronous file access;
+* long modifier chains;
+* overlays, masks, shadows, and blurs.
 
 Risky:
 
@@ -135,11 +146,15 @@ struct TransactionRowModel: Identifiable, Equatable {
 
 The row should mostly render `TransactionRowModel` values instead of preparing display data. Render-ready models are especially useful in long lists, paginated feeds, search results, and frequently refreshed screens.
 
+Do not flag every small formatting call mechanically. Treat row work as a performance risk when it is repeated across many rows, happens during scrolling or typing, or appears in a measured hot path.
+
 ## Pagination and update locality
 
 For paginated data with non-trivial rows, avoid modeling the UI as one endlessly growing flat array when appending a page causes broad reconciliation or visible hitches.
 
-Risky when rows are expensive:
+A flat array append is often fine for simple rows with stable identity. Treat it as a risk when append causes measured hitches, old rows are rebuilt expensively, or pagination updates coincide with heavy row work.
+
+Risky when rows are expensive and append is visible in profiling:
 
 ```swift
 List {
@@ -149,9 +164,11 @@ List {
 }
 ```
 
-Appending to one large flat array can force SwiftUI to reconcile the collection from the flat list boundary. Even if only new elements were appended, the parent `ForEach` still observes one changed collection, and expensive rows can make this update path visible as a hitch.
+Appending to one large flat array can make the append path harder to reason about when old and new rows share one large collection boundary. Even if only new elements were appended, a frequently updating parent, expensive row body, broad dependencies, or repeated transformation work can make this update path visible as a hitch.
 
-Prefer stable page or section models when pages are appended incrementally, existing rows should remain unchanged, rows include formatting/icons/menus/swipe actions/bindings/conditional modifiers, or profiling shows a main-thread spike during page append.
+Prefer stable page or section models when pages are appended incrementally, existing rows should remain unchanged, rows include formatting/icons/menus/swipe actions/bindings/heavy modifiers, or profiling shows a main-thread spike during page append.
+
+Do not introduce page models mechanically. Use them when they preserve a real backend or product pagination boundary, reduce repeated work, or make measured append behavior easier to validate.
 
 Example:
 
@@ -186,6 +203,8 @@ The goal is not to use `Section` for its own sake. The goal is to make the chang
 
 Stable page boundaries can reduce repeated reconciliation and row construction work during pagination, especially when old pages do not change. This is a pattern to test, not a guarantee.
 
+Using `Section` can affect list styling, accessibility grouping, separators, headers, footers, and platform behavior. If those semantics are undesirable, keep page boundaries in the model but render them without visible section styling where appropriate.
+
 ## Do not derive pages inside `body`
 
 Do not create page sections by chunking a flat array inside `body`.
@@ -207,6 +226,7 @@ This can allocate new page values during rendering, create unstable page identit
 Prefer storing pages as stable state:
 
 ```swift
+@MainActor
 @Observable
 final class TransactionsModel {
     var pages: [TransactionPage] = []
@@ -214,6 +234,8 @@ final class TransactionsModel {
 ```
 
 If the backend returns pages, preserve that boundary in the UI model. If the backend returns a flat result, create stable page models during data ingestion, not during view rendering.
+
+For UI-facing list state, prefer explicit main-actor isolation. Build rows off the main actor when safe, then append pages with one compact main-actor update.
 
 ## Filtering, sorting, and formatting
 
@@ -242,16 +264,20 @@ Treat row-level interactions as part of row complexity.
 
 Rows become more expensive when every row builds `swipeActions`, menus, context menus, gestures, buttons, custom bindings, or closure-heavy action surfaces.
 
-Closures created inside `body` can make row values less stable because SwiftUI cannot meaningfully compare closures.
+Stored closure properties and closure-heavy row APIs can make row values harder to compare and reason about because SwiftUI cannot meaningfully compare closures. This is a review signal, not proof of a performance issue.
 
 Prefer keeping stored row input visual and small. When closures are necessary, use explicit capture lists and capture stable IDs instead of whole parent values:
 
 ```swift
 ForEach(page.rows) { row in
     TransactionRow(row: row)
-        .onTapGesture { [model, id = row.id] in model.openTransaction(id) }
+        .onTapGesture { [model, id = row.id] in
+            model.openTransaction(id)
+        }
         .swipeActions {
-            Button("Archive") { [model, id = row.id] in model.archiveTransaction(id) }
+            Button("Archive") { [model, id = row.id] in
+                model.archiveTransaction(id)
+            }
         }
 }
 ```
@@ -272,6 +298,8 @@ List(cards) { card in
 }
 ```
 
+Inside rows, `GeometryReader` can also change sizing behavior because it takes the proposed space from its parent. If it must be used in a row, make the expected height and alignment explicit.
+
 Prefer reading geometry at a stable container boundary or using layout APIs that do not need explicit geometry:
 
 ```swift
@@ -289,7 +317,7 @@ Risky:
 
 ```swift
 .onAppear {
-    if row == rows.last {
+    if row.id == rows.last?.id {
         Task { await model.loadNextPage() }
     }
 }
@@ -298,20 +326,47 @@ Risky:
 Guard pagination explicitly:
 
 ```swift
-.onAppear {
+.task(id: row.id) {
     guard model.shouldLoadNextPage(afterAppearing: row.id) else { return }
-    Task { await model.loadNextPage() }
+    await model.loadNextPageIfNeeded(trigger: row.id)
 }
 ```
 
 A pagination trigger should check that the row is close enough to the end, a next page exists, a page load is not already running, the same request has not already been fired, and the trigger still matches the current query/filter/sort state.
 
+For large lists, prefer a sentinel or footer prefetch view over attaching lifecycle work to every row. Use row-level triggers only when the guard is cheap and duplicate attempts are fully handled by the model.
+
+Example sentinel:
+
+```swift
+List {
+    ForEach(model.pages) { page in
+        Section {
+            ForEach(page.rows) { row in
+                TransactionRow(row: row)
+            }
+        }
+    }
+
+    if model.pagination.hasNextPage {
+        ProgressView()
+            .task(id: model.pagination.nextPageKey) {
+                await model.loadNextPageIfNeeded(trigger: model.pagination.nextPageKey)
+            }
+    }
+}
+```
+
 For button-based pagination, keep the button state explicit:
 
 ```swift
-Button("Load more") { Task { await model.loadNextPage() } }
-    .disabled(model.pagination.isLoading || !model.pagination.hasNextPage)
+Button("Load more") {
+    Task { await model.loadNextPageIfNeeded(trigger: model.pagination.nextPageKey) }
+}
+.disabled(model.pagination.isLoading || !model.pagination.hasNextPage)
 ```
+
+The model method should be idempotent. It should guard loading state, next-page availability, requested page keys, current filter/sort/search context, and cancellation before committing visible state.
 
 ## Background work and UI headroom
 
@@ -320,6 +375,12 @@ Moving data preparation off the main actor can help, but it does not make the wo
 Good candidates for background preparation include mapping network responses to render models, formatting large row batches, sorting, grouping, filtering, image resizing or decoding when safe, and cache lookups that do not require main-actor state.
 
 Apply compact final state updates on the main actor.
+
+Extracting row preparation into an `async` function does not automatically move CPU work off the main actor. The builder must not be main-actor-isolated, and transferred inputs and outputs should be safe across concurrency boundaries.
+
+Move image preparation off the main actor only with APIs and data types that are safe for background use. Avoid touching UIKit view, view controller, layer, or SwiftUI view state from background work.
+
+If the UI immediately awaits background preparation before it can update, the interaction can still feel blocked. Prefer cancellation, debounce, incremental updates, or a loading state when the work is user-visible.
 
 Do not saturate all CPU cores during scrolling. Aggressive background work can still hurt responsiveness if it competes with UI rendering.
 
@@ -331,17 +392,17 @@ For scroll hitches, reproduce the same scroll path and use Animation Hitches, Co
 
 For pagination append hitches:
 
-1. 1Start with a known number of existing rows.
-2. 2Trigger pagination by button tap or near-end scroll.
-3. 3Signpost: pagination triggered, request started, response received, render models built, page appended to state, first new row visible.
-4. 4In Time Profiler, inspect the main thread during the append window.
-5. 5Compare flat append with stable page/section append using the same scenario.
+1. Start with a known number of existing rows.
+2. Trigger pagination by button tap or near-end scroll.
+3. Signpost: pagination triggered, request started, response received, render models built, page appended to state, first new row visible.
+4. In Time Profiler, inspect the main thread during the append window.
+5. Compare flat append with stable page/section append using the same scenario.
 
 Useful Time Profiler call tree settings:
 
-- Separate by Thread;
-- Invert Call Tree;
-- Hide System Libraries.
+* Separate by Thread;
+* Invert Call Tree;
+* Hide System Libraries.
 
 Look for app-specific work first: row initializers, row `body` work, formatter creation, sorting/filtering/grouping, render model rebuilding, image preparation, closure/action builders, and custom layout code.
 
@@ -349,20 +410,25 @@ Use the SwiftUI instrument when available to inspect body invocation count, body
 
 Use Allocations when the symptom suggests repeated temporary arrays, repeated strings, formatter creation, rebuilding large render-model arrays, per-row type erasure, or large copy-on-write structures copied during rendering.
 
+Use MetricKit or production telemetry to detect trends in hangs, animation responsiveness, memory growth, or slow interactions, then reproduce locally with Instruments when possible.
+
 Temporary probes such as `Self._printChanges()`, row body counters, pagination trigger logs, and render model duration logs can help during investigation. Remove debug probes before shipping.
 
 ## Common mistakes
 
-- Replacing `List` with `LazyVStack` without identifying the actual bottleneck.
-- Using `VStack` for long dynamic content.
-- Using index-based identity for rows that can move, be inserted, or be deleted.
-- Using `UUID()` or computed UUIDs as row identity.
-- Sorting, filtering, grouping, formatting, or chunking inside `body`.
-- Appending pages to one flat array when profiling shows broad update work and expensive rows.
-- Creating page sections by chunking a flat array during rendering.
-- Treating `Section` as a guaranteed performance fix instead of a stable pagination boundary to validate.
-- Building heavy swipe actions, menus, custom bindings, or closures for every row without checking row cost.
-- Placing `GeometryReader` or preference-key feedback inside every row.
-- Starting unguarded pagination loads from `.onAppear`.
-- Saturating the CPU with background processing while the user is scrolling.
-- Claiming a frame-rate or millisecond improvement without a trace, log, benchmark, or user-provided measurement.
+* Replacing `List` with `LazyVStack` without identifying the actual bottleneck.
+* Using `VStack` for long dynamic content.
+* Using index-based identity for rows that can move, be inserted, or be deleted.
+* Using `UUID()` or computed UUIDs as row identity.
+* Sorting, filtering, grouping, formatting, or chunking inside `body`.
+* Treating flat arrays as automatically bad even when rows are simple, identity is stable, and no append hitch is measured.
+* Appending pages to one flat array when profiling shows broad update work and expensive rows.
+* Creating page sections by chunking a flat array during rendering.
+* Treating `Section` as a guaranteed performance fix instead of a stable pagination boundary to validate.
+* Building heavy swipe actions, menus, custom bindings, or closures for every row without checking row cost.
+* Placing `GeometryReader` or preference-key feedback inside every row.
+* Starting unguarded pagination loads from `.onAppear`.
+* Creating unstructured pagination tasks without idempotency, cancellation, or duplicate-load guards.
+* Assuming an `async` helper automatically moves row preparation off the main actor.
+* Saturating the CPU with background processing while the user is scrolling.
+* Claiming a frame-rate or millisecond improvement without a trace, log, benchmark, or user-provided measurement.
