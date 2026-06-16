@@ -8,22 +8,22 @@ The goal is to keep invalidation local: a state change should affect only the vi
 
 ## Contents
 
-- [Agent goal](#agent-goal)
-- [Core model](#core-model)
-- [ObservableObject vs Observation](#observableobject-vs-observation)
-- [Precise language](#precise-language)
-- [Migration rule](#migration-rule)
-- [Pre-iOS 17 rule](#pre-ios-17-rule)
-- [Dependency islands](#dependency-islands)
-- [Passing values vs passing models](#passing-values-vs-passing-models)
-- [Environment dependencies](#environment-dependencies)
-- [Collection dependencies](#collection-dependencies)
-- [Computed properties as hidden dependencies](#computed-properties-as-hidden-dependencies)
-- [Nested object graphs](#nested-object-graphs)
-- [Validation](#validation)
-- [Common mistakes](#common-mistakes)
-- [Review checklist](#review-checklist)
-- [Final rule](#final-rule)
+* [Agent goal](#agent-goal)
+* [Core model](#core-model)
+* [ObservableObject vs Observation](#observableobject-vs-observation)
+* [Precise language](#precise-language)
+* [Migration rule](#migration-rule)
+* [Pre-iOS 17 rule](#pre-ios-17-rule)
+* [Dependency islands](#dependency-islands)
+* [Passing values vs passing models](#passing-values-vs-passing-models)
+* [Environment dependencies](#environment-dependencies)
+* [Collection dependencies](#collection-dependencies)
+* [Computed properties as hidden dependencies](#computed-properties-as-hidden-dependencies)
+* [Nested object graphs](#nested-object-graphs)
+* [Validation](#validation)
+* [Common mistakes](#common-mistakes)
+* [Review checklist](#review-checklist)
+* [Final rule](#final-rule)
 
 ## Agent goal
 
@@ -31,11 +31,11 @@ Help the user understand which state reads can cause a SwiftUI view to be re-eva
 
 When reviewing code, answer these questions:
 
-1. 1What data does this view read while building `body`?
-2. 2Which changes can affect that dependency?
-3. 3Is the read located in the smallest view that needs it?
-4. 4Would passing a value, passing an observable model, or splitting a model make the dependency clearer?
-5. 5How can the user validate the change without pretending it was measured?
+1. What data does this view read while building `body`?
+2. Which changes can affect that dependency?
+3. Is the read located in the smallest view that needs it?
+4. Would passing a value, passing an observable model, or splitting a model make the dependency clearer?
+5. How can the user validate the change without pretending it was measured?
 
 ## Core model
 
@@ -43,10 +43,10 @@ SwiftUI updates are driven by dependencies, identity, environment, transactions,
 
 For this reference, focus on dependencies:
 
-- A view depends on the observable values it reads while evaluating `body`.
-- A broad read can make a large view subtree sensitive to unrelated state changes.
-- Moving a read into a smaller child view can reduce the amount of view work affected by that state.
-- Moving a read upward can accidentally make the parent depend on data that only a child needs.
+* A view depends on the observable values it reads while evaluating `body`.
+* A broad read can make a large view subtree sensitive to unrelated state changes.
+* Moving a read into a smaller child view can reduce the amount of view work affected by that state.
+* Moving a read upward can accidentally make the parent depend on data that only a child needs.
 
 Do not optimize by guessing. Identify the actual read that creates the dependency.
 
@@ -87,6 +87,7 @@ Observation can track property reads more precisely. A view that reads one obser
 Preferred for iOS 17+ when it fits the project:
 
 ```swift
+@MainActor
 @Observable
 final class ProfileModel {
     var name = ""
@@ -104,6 +105,8 @@ struct ProfileNameView: View {
 ```
 
 Here, the body reads `model.name`. A change to `unreadCount` is not expected to invalidate this view through the `model.name` dependency alone.
+
+For UI-facing observable models, prefer explicit main-actor isolation when the model is mutated from async code or coordinates UI state. Pure domain models or background data models may have different isolation.
 
 Still avoid absolute claims. A view can be re-evaluated for other reasons: parent updates, environment changes, identity changes, transactions, animations, or other dependencies.
 
@@ -131,16 +134,18 @@ Avoid:
 
 When reviewing code that can use Observation:
 
-- prefer `@Observable` for new observable models on iOS 17+ code paths;
-- remove unnecessary `@Published` from migrated models;
-- pass observable models as regular values when no binding is needed;
-- use `@Bindable` only where a view needs bindings to mutable properties;
-- store a view-owned observable model in `@State`;
-- do not keep old `ObservableObject` ownership patterns automatically.
+* prefer `@Observable` for new SwiftUI-facing observable models on iOS 17+ code paths when the project does not need Combine-based observation or older deployment support;
+* make UI-facing observable model isolation explicit when async mutations or UI state coordination are involved;
+* remove unnecessary `@Published` from migrated models;
+* pass observable models as regular values when no binding is needed;
+* use `@Bindable` only where a view needs bindings to mutable properties;
+* store a view-owned observable model in `@State`;
+* do not keep old `ObservableObject` ownership patterns automatically.
 
 Example:
 
 ```swift
+@MainActor
 @Observable
 final class ProfileModel {
     var name = ""
@@ -164,7 +169,9 @@ struct ProfileNameEditor: View {
 }
 ```
 
-Do not replace every `ObservableObject` blindly. Keep it when the code needs Combine publishers, supports older deployment targets, or relies on existing `objectWillChange` behavior.
+Use `@Bindable` only at the view boundary that creates bindings such as `$model.name`. Read-only child views should receive the model as a regular value.
+
+Do not replace every `ObservableObject` blindly. Keep it when the code needs Combine publishers, supports older deployment targets, interacts with UIKit or Combine consumers, or relies on existing `objectWillChange` behavior.
 
 ## Pre-iOS 17 rule
 
@@ -275,19 +282,19 @@ This is useful only when it narrows dependencies or makes the update path cleare
 
 Prefer passing narrow values when:
 
-- the child is a reusable presentational component;
-- the parent already needs the same value;
-- the value is cheap and stable;
-- the dependency living in the parent is acceptable;
-- the child should not know about the model type.
+* the child is a reusable presentational component;
+* the parent already needs the same value;
+* the value is cheap and stable;
+* the dependency living in the parent is acceptable;
+* the child should not know about the model type.
 
 Prefer passing an observable model when:
 
-- the parent does not otherwise need the property;
-- the property read should belong to the child;
-- the child needs bindings through `@Bindable`;
-- the child owns a small dependency island;
-- passing separate values would force the parent to read many unrelated properties.
+* the parent does not otherwise need the property;
+* the property read should belong to the child;
+* the child needs bindings through `@Bindable`;
+* the child owns a small dependency island;
+* passing separate values would force the parent to read many unrelated properties.
 
 Do not pass entire models automatically. Passing a model can hide dependencies in the child API. Passing values can move dependencies into the parent.
 
@@ -335,7 +342,9 @@ struct ToolbarTitle: View {
 }
 ```
 
-For legacy `@EnvironmentObject`, remember that the observed object usually has object-level invalidation. For Observation-based environment models, property reads can be more precise, but broad environment access can still make dependencies harder to see.
+For Observation environment values, `@Environment(AppModel.self)` can track property reads more precisely, but broad environment access still hides dependencies and makes update paths harder to audit.
+
+For legacy `@EnvironmentObject`, remember that the observed object usually has object-level invalidation.
 
 ## Collection dependencies
 
@@ -355,16 +364,22 @@ struct InboxBadge: View {
 
 This has two problems:
 
-- the badge depends on the whole `messages` collection;
-- it performs filtering work during body evaluation.
+* the badge depends on the whole `messages` collection;
+* it performs filtering work during body evaluation.
 
 Prefer render-ready state with clear invalidation rules:
 
 ```swift
+@MainActor
 @Observable
 final class InboxModel {
     var messages: [Message] = []
     var unreadCount = 0
+
+    func setMessages(_ newMessages: [Message]) {
+        messages = newMessages
+        unreadCount = newMessages.lazy.filter(\.isUnread).count
+    }
 }
 
 struct InboxBadge: View {
@@ -376,6 +391,8 @@ struct InboxBadge: View {
 }
 ```
 
+When storing aggregate values such as `unreadCount`, make the invalidation and update rule explicit. Derived state improves dependency scope only if it stays consistent with the source data.
+
 For lists, avoid filtering, sorting, grouping, or formatting inside repeated content. Prepare visible rows or aggregate values before rendering. Use `body-cost-and-render-models.md` when the main issue is expensive transformation work rather than dependency scope.
 
 ## Computed properties as hidden dependencies
@@ -385,6 +402,7 @@ Computed properties can hide broad reads.
 Risky:
 
 ```swift
+@MainActor
 @Observable
 final class DashboardModel {
     var user: User
@@ -421,13 +439,15 @@ struct HeaderView: View {
 }
 ```
 
+Pass explicit values when the parent already owns those reads or when they come from a prepared render model. If only the header needs the values, moving the reads into a smaller dependency island may be better.
+
 Or build a render-ready header model when the formatting or aggregation is non-trivial.
 
 Use `body-cost-and-render-models.md` when the computed property is expensive. Use this reference when the computed property hides dependencies.
 
 ## Nested object graphs
 
-Observation can track properties across observable references read in `body`, but do not use this as a reason to pass one giant object graph everywhere.
+Observation can track reads through observable references when those references and properties participate in Observation. Do not assume every nested object graph gives precise invalidation automatically.
 
 Good:
 
@@ -463,12 +483,14 @@ When dependency scope is uncertain, suggest lightweight validation before large 
 
 Useful checks:
 
-- add temporary `Self._printChanges()` in suspicious views;
-- log which state mutation happened before an unexpected update;
-- add signposts around the interaction that changes state;
-- compare body update logs before and after moving reads into smaller subviews;
-- use the SwiftUI instrument when available to inspect body invocation count and update scope;
-- use Time Profiler only when static review and debug logs are not enough.
+* add temporary `Self._printChanges()` in suspicious views;
+* log which state mutation happened before an unexpected update;
+* add signposts around the interaction that changes state;
+* compare body update logs before and after moving reads into smaller subviews;
+* use the SwiftUI instrument when available to inspect body invocation count and update scope;
+* use Time Profiler only when static review and debug logs are not enough.
+
+Use `_printChanges()` only as a temporary local debugging probe and remove it before shipping.
 
 Do not claim measured improvement unless a measurement was actually taken.
 
@@ -482,31 +504,35 @@ Avoid:
 
 ## Common mistakes
 
-- Treating `@Observable` as a magic performance fix while leaving broad reads in large parent views.
-- Passing a whole model into every child without checking where the properties are read.
-- Passing only derived values when that forces the parent to read state that only the child needs.
-- Splitting models only for architecture aesthetics, not dependency reduction.
-- Hiding broad reads inside computed properties.
-- Reading global environment models inside small presentational views.
-- Reading an entire collection to display one aggregate value.
-- Using `@ObservationIgnored` to hide state that should update the UI.
-- Claiming a view updates only for one reason when parent updates, environment changes, identity, transactions, or animations can also re-evaluate it.
+* Treating `@Observable` as a magic performance fix while leaving broad reads in large parent views.
+* Passing a whole model into every child without checking where the properties are read.
+* Passing only derived values when that forces the parent to read state that only the child needs.
+* Splitting models only for architecture aesthetics, not dependency reduction.
+* Hiding broad reads inside computed properties.
+* Reading global environment models inside small presentational views.
+* Reading an entire collection to display one aggregate value.
+* Storing derived aggregate state without a clear consistency rule.
+* Using `@ObservationIgnored` to hide state that should update the UI.
+* Claiming a view updates only for one reason when parent updates, environment changes, identity, transactions, or animations can also re-evaluate it.
+
+Use `@ObservationIgnored` only for state that should not drive UI updates, such as caches, services, diagnostics, or derived implementation details with explicit invalidation elsewhere.
 
 ## Review checklist
 
 When reviewing dependency scope, check:
 
-- Does the parent read properties that only children display?
-- Does a small child observe a large `ObservableObject`?
-- Does a computed property hide reads from multiple model fields?
-- Does an environment read hide a broad dependency?
-- Does a badge, header, or footer read a whole collection?
-- Does the code use Observation but keep old object-level design patterns?
-- Does the view need bindings, or can it receive values?
-- Would moving the read into a child narrow updates?
-- Would moving the read into a parent make updates broader?
-- Is a proposed split tied to a real update problem?
-- Is there a validation step for suspected broad invalidation?
+* Does the parent read properties that only children display?
+* Does a small child observe a large `ObservableObject`?
+* Does a computed property hide reads from multiple model fields?
+* Does an environment read hide a broad dependency?
+* Does a badge, header, or footer read a whole collection?
+* Does the code use Observation but keep old object-level design patterns?
+* Does the view need bindings, or can it receive values?
+* Would moving the read into a child narrow updates?
+* Would moving the read into a parent make updates broader?
+* Is a proposed split tied to a real update problem?
+* Is derived aggregate state kept consistent with its source data?
+* Is there a validation step for suspected broad invalidation?
 
 ## Final rule
 
