@@ -371,7 +371,7 @@ Fix direction: batch results, coalesce updates, reduce `MainActor` work, narrow 
 * The main thread can be blocked without high CPU.
 * SwiftUI `body` evaluation is not automatically the problem; repeated expensive work inside or triggered by updates is the problem.
 * `LazyVStack` is not equivalent to cell reuse. Do not recommend replacing `List` blindly.
-* For large feeds, compare `List`, `LazyVStack`, and UIKit-backed lists under the same data and interaction. The right container depends on OS version, row complexity, update pattern, identity stability, and reuse behavior.
+* For large feeds, compare `List` and `LazyVStack` under the same data and interaction. The right container depends on OS version, row complexity, update pattern, identity stability, and reuse behavior.
 * `drawingGroup()` and rasterization-style fixes can move cost or increase memory. Do not suggest them as generic fixes.
 * `EquatableView` helps only when equality is cheap and prevents meaningful repeated work.
 * Caching can reduce hitches but can also increase memory pressure and later stalls.
