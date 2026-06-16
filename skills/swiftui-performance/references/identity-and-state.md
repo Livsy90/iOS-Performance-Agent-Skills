@@ -1,24 +1,25 @@
 # Identity and State
 
-Use this reference when reviewing SwiftUI code that involves structural identity, explicit `.id(...)`, `ForEach` identity, local state lifetime, `@State`, `@StateObject`, `@ObservedObject`, or owned observable models.
+Use this reference when reviewing SwiftUI code that involves structural identity, explicit `.id(...)`, `ForEach` identity, conditional modifiers, local state lifetime, `@State`, `@StateObject`, `@ObservedObject`, or owned observable models.
 
 This reference is about identity and state lifetime. Keep Observation dependency granularity, broad model reads, list pagination, closure-heavy rows, custom bindings, body cost, and profiling details in their dedicated references.
 
 ## Contents
 
-- [Agent goal](#agent-goal)
-- [Core mental model](#core-mental-model)
-- [Structural identity](#structural-identity)
-- [Explicit identity with `.id(...)`](#explicit-identity-with-id)
-- [`ForEach` identity](#foreach-identity)
-- [Local `@State` lifetime](#local-state-lifetime)
-- [State ownership boundaries](#state-ownership-boundaries)
-- [`@StateObject` and `@ObservedObject`](#stateobject-and-observedobject)
-- [Owned `@Observable` models](#owned-observable-models)
-- [State reset diagnostics](#state-reset-diagnostics)
-- [Review language](#review-language)
-- [Common mistakes](#common-mistakes)
-- [Minimal checklist](#minimal-checklist)
+* [Agent goal](#agent-goal)
+* [Core mental model](#core-mental-model)
+* [Structural identity](#structural-identity)
+* [Conditional modifiers and identity](#conditional-modifiers-and-identity)
+* [Explicit identity with `.id(...)`](#explicit-identity-with-id)
+* [`ForEach` identity](#foreach-identity)
+* [Local `@State` lifetime](#local-state-lifetime)
+* [State ownership boundaries](#state-ownership-boundaries)
+* [`@StateObject` and `@ObservedObject`](#stateobject-and-observedobject)
+* [Owned `@Observable` models](#owned-observable-models)
+* [State reset diagnostics](#state-reset-diagnostics)
+* [Review language](#review-language)
+* [Common mistakes](#common-mistakes)
+* [Minimal checklist](#minimal-checklist)
 
 ## Agent goal
 
@@ -26,11 +27,11 @@ Help the user understand whether SwiftUI can preserve the right view identity an
 
 When reviewing code, answer:
 
-- Does this view keep the same identity across normal updates?
-- Is local state attached to a stable identity?
-- Are collection rows identified by stable data identity rather than position or temporary values?
-- Is the model owned by this view, injected into this view, or owned elsewhere?
-- Would a branch, explicit `.id(...)`, or unstable `ForEach` ID accidentally reset state?
+* Does this view keep the same identity across normal updates?
+* Is local state attached to a stable identity?
+* Are collection rows identified by stable data identity rather than position or temporary values?
+* Is the model owned by this view, injected into this view, or owned elsewhere?
+* Would a branch, conditional modifier, explicit `.id(...)`, or unstable `ForEach` ID accidentally reset state?
 
 Avoid vague claims such as "SwiftUI redraws everything." Prefer precise language about identity, lifetime, and ownership boundaries.
 
@@ -40,9 +41,9 @@ SwiftUI view values are temporary descriptions. State is not stored inside the v
 
 A view's identity usually comes from:
 
-- its structural position in the view tree;
-- the concrete view type at that position;
-- explicit identity provided by APIs such as `ForEach` or `.id(...)`.
+* its structural position in the view tree;
+* the concrete view type at that position;
+* explicit identity provided by APIs such as `ForEach` or `.id(...)`.
 
 When identity changes, SwiftUI may treat the view as a different view. State attached to the previous identity can be discarded and new state can be created.
 
@@ -50,9 +51,9 @@ Review identity issues before suggesting lower-level optimization. Many SwiftUI 
 
 ## Structural identity
 
-SwiftUI normally derives identity from structure. Two branches that look visually similar can still represent different identities if they produce different view types or different positions in the hierarchy.
+SwiftUI normally derives identity from structure. Two branches that look visually similar can still represent different identities if they produce different concrete view types, wrappers, modifiers, or positions in the hierarchy.
 
-Risky when the same conceptual view appears in separate branches:
+Risky when the same conceptual view appears as different structure:
 
 ```swift
 struct PaymentStatusView: View {
@@ -61,6 +62,9 @@ struct PaymentStatusView: View {
     var body: some View {
         if isPending {
             StatusCard(title: "Processing")
+                .overlay {
+                    ProgressView()
+                }
         } else {
             StatusCard(title: "Complete")
         }
@@ -75,12 +79,71 @@ struct PaymentStatusView: View {
     let isPending: Bool
 
     var body: some View {
-        StatusCard(title: isPending ? "Processing" : "Complete")
+        StatusCard(
+            title: isPending ? "Processing" : "Complete",
+            showsProgress: isPending
+        )
     }
 }
 ```
 
+Prefer value-based modifiers for value changes such as opacity, disabled state, text, color, visibility, or simple styling when the same conceptual view should keep state. Keep structural branches when the UI is genuinely different.
+
 Do not mechanically remove all branches. Branches are normal SwiftUI. Flag them only when they accidentally reset state, create unstable layout, or make a hot repeated view structurally unpredictable.
+
+## Conditional modifiers and identity
+
+Be careful with custom conditional modifier helpers such as:
+
+```swift
+extension View {
+    @ViewBuilder
+    func `if`<Content: View>(
+        _ condition: Bool,
+        transform: (Self) -> Content
+    ) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
+    }
+}
+```
+
+This pattern is convenient, but it can create different structural identities for the modified and unmodified branches. When the condition changes dynamically, SwiftUI may treat the result as a different subtree. That can reset local `@State`, `@FocusState`, `@StateObject`, restart lifecycle-bound work, or produce surprising animation behavior.
+
+Risky when the condition changes during the view lifetime:
+
+```swift
+Text(taskName)
+    .padding()
+    .if(isUrgent) { view in
+        view
+            .font(.system(size: 16, weight: .bold))
+            .border(Color.red, width: 2)
+    }
+```
+
+Prefer value-based modifiers when the conceptual view should remain the same and only modifier values change:
+
+```swift
+Text(taskName)
+    .padding()
+    .font(.system(size: 16, weight: isUrgent ? .bold : .regular))
+    .border(isUrgent ? Color.red : Color.clear, width: 2)
+```
+
+Use conditional modifiers mainly when:
+
+* the condition is static for the view lifetime;
+* the modified and unmodified branches intentionally represent different structure;
+* resetting local state and lifecycle work is acceptable;
+* the helper improves readability without hiding identity changes.
+
+Do not ban conditional modifiers mechanically. They are often fine for static configuration, platform-specific branches, feature flags that do not change while the view is alive, or structural differences that are intentional.
+
+Flag them when the condition changes at runtime and the subtree contains local state, focus, animations, tasks, gestures, or row-local state.
 
 ## Explicit identity with `.id(...)`
 
@@ -88,10 +151,10 @@ Use `.id(...)` only when creating a deliberate identity boundary.
 
 Good reasons:
 
-- reset local state intentionally;
-- make a detail or editor view start fresh for a different entity;
-- define a scroll target;
-- force a known lifecycle boundary after a meaningful identity change.
+* reset local state intentionally;
+* make a detail or editor view start fresh for a different entity;
+* define a scroll target;
+* force a known lifecycle boundary after a meaningful identity change.
 
 Risky:
 
@@ -163,18 +226,20 @@ struct MessageRowModel: Identifiable {
 
 Use `id: \.self` only when the value is truly unique and stable for the lifetime of the collection. It is usually fine for a fixed list of unique strings or enum values. It is risky for duplicate values, mutable values, or values whose equality changes when visible content changes.
 
+Index identity is acceptable only when identity is truly positional by product design: fixed tabs, fixed rating stars, fixed placeholders, or static settings rows with no insertion, deletion, filtering, or reordering.
+
 ## Local `@State` lifetime
 
 Use `@State` for local value state owned by a stable view identity.
 
 Good candidates:
 
-- expansion state inside a component;
-- local draft text;
-- focus-related UI flags;
-- temporary selection inside a picker-like component;
-- small animation state;
-- presentation toggles owned by the current view.
+* expansion state inside a component;
+* local draft text;
+* focus-related UI flags;
+* temporary selection inside a picker-like component;
+* small animation state;
+* presentation toggles owned by the current view.
 
 Keep `@State` private whenever possible. External code should not depend on a child view's private state storage.
 
@@ -227,6 +292,15 @@ struct EditableUserNameView: View {
 ```
 
 In this case, `draftName` is a local draft. It should not automatically track every later parent value unless the product behavior requires that.
+
+If the snapshot should reset for a different entity, attach the editor to a stable entity identity or handle the change explicitly. Do not expect `State(initialValue:)` to re-run for ordinary parent updates.
+
+```swift
+EditableUserNameView(initialName: user.name)
+    .id(user.id)
+```
+
+Use this only if changing `user.id` should intentionally discard local draft state, focus, validation state, temporary selections, and lifecycle-bound work for the previous entity.
 
 ## State ownership boundaries
 
@@ -291,7 +365,11 @@ struct RatesContent: View {
 }
 ```
 
-Do not create an owned model as a plain stored property in a view. SwiftUI view values can be recreated, and a plain stored reference does not express SwiftUI-managed lifetime.
+For `ObservableObject`, use `@ObservedObject` in the child when the child needs to observe changes. For Observation models, passing the model reference is enough for property access tracking. Use `@Bindable` only when the child needs bindings.
+
+Do not create an owned, stateful observable model as a plain stored property in a view. SwiftUI view values can be recreated, and a plain stored reference does not express SwiftUI-managed lifetime.
+
+A plain stored property is fine for immutable dependencies, externally owned services, value inputs, or references whose lifetime is intentionally managed elsewhere.
 
 Do not claim `@StateObject` is faster than `@ObservedObject`. The main distinction is ownership and lifetime.
 
@@ -300,6 +378,7 @@ Do not claim `@StateObject` is faster than `@ObservedObject`. The main distincti
 For iOS 17 and later, an `@Observable` model owned by a view can be stored with `@State`.
 
 ```swift
+@MainActor
 @Observable
 final class RatesModel {
     var rows: [RateRowModel] = []
@@ -317,11 +396,25 @@ struct RatesView: View {
 
 Use this when the view owns the model's lifetime.
 
+For UI-facing observable models, prefer making main-actor isolation explicit when the model is mutated from async code or coordinates UI state. This does not mean every `@Observable` type in the app must be `@MainActor`; pure domain models or background data models may have different isolation.
+
 If a parent owns the model, inject it into the child instead of creating it again:
 
 ```swift
 struct RatesContent: View {
     let model: RatesModel
+}
+```
+
+If the child needs editable bindings into an `@Observable` model, use `@Bindable`:
+
+```swift
+struct RatesContent: View {
+    @Bindable var model: RatesModel
+
+    var body: some View {
+        Toggle("Refreshing", isOn: $model.isRefreshing)
+    }
 }
 ```
 
@@ -331,23 +424,24 @@ This reference covers ownership and lifetime. Detailed Observation dependency be
 
 Suspect accidental identity changes when the user reports:
 
-- text fields lose input unexpectedly;
-- focus disappears during updates;
-- scroll position resets without intent;
-- rows lose expansion or selection state after filtering;
-- async `.task` work restarts repeatedly;
-- animations restart during unrelated updates;
-- row-local state appears attached to the wrong item after insertion or deletion.
+* text fields lose input unexpectedly;
+* focus disappears during updates;
+* scroll position resets without intent;
+* rows lose expansion or selection state after filtering;
+* async `.task` work restarts repeatedly;
+* animations restart during unrelated updates;
+* row-local state appears attached to the wrong item after insertion or deletion.
 
 Check:
 
-- Is `.id(UUID())` or another unstable ID used?
-- Does a `ForEach` use offsets, indices, or mutable values as identity?
-- Does a row model compute a new ID on every access?
-- Does conditional structure replace one stateful view with another?
-- Is local state initialized from parent input and then expected to track later changes?
-- Is an owned model created with `@ObservedObject` or a plain stored property?
-- Is state owned too high or too low in the tree?
+* Is `.id(UUID())` or another unstable ID used?
+* Does a `ForEach` use offsets, indices, or mutable values as identity?
+* Does a row model compute a new ID on every access?
+* Does conditional structure replace one stateful view with another?
+* Does a conditional modifier hide runtime structural changes?
+* Is local state initialized from parent input and then expected to track later changes?
+* Is an owned model created with `@ObservedObject` or a plain stored property?
+* Is state owned too high or too low in the tree?
 
 ## Review language
 
@@ -369,27 +463,36 @@ This view creates its own observable model, so `@StateObject` is the correct own
 This `@State` value is initialized from a parent input, so it behaves like an initial snapshot. If the view should always show the latest parent value, derive it directly from the input instead.
 ```
 
+```md
+This conditional modifier helper can produce different structure when the condition changes. If this subtree needs stable local state or smooth animation, prefer value-based modifiers or an explicit structural branch with intentional identity.
+```
+
 ## Common mistakes
 
-- Do not add `.id(...)` everywhere. Explicit identity is a tool, not a default requirement.
-- Do not replace every branch with value-based modifiers. Structural branching is fine when it expresses genuinely different UI.
-- Do not move all state to the parent. Local state is often better for local UI behavior.
-- Do not move all state to children. Shared source of truth still belongs at the coordinating owner.
-- Do not use offset identity for mutable or reorderable collections.
-- Do not create IDs with `UUID()` in an `id` computed property.
-- Do not claim `@StateObject` is a performance optimization over `@ObservedObject`; it is an ownership rule.
-- Do not claim Observation removes the need to think about identity. Observation changes dependency tracking, not identity rules.
+* Do not add `.id(...)` everywhere. Explicit identity is a tool, not a default requirement.
+* Do not replace every branch with value-based modifiers. Structural branching is fine when it expresses genuinely different UI.
+* Do not hide runtime structural changes behind custom conditional modifier helpers when the view needs stable local state or smooth animation.
+* Do not move all state to the parent. Local state is often better for local UI behavior.
+* Do not move all state to children. Shared source of truth still belongs at the coordinating owner.
+* Do not use offset or index identity for mutable or reorderable collections.
+* Do not create IDs with `UUID()` in an `id` computed property.
+* Do not use `@State(initialValue:)` as if it automatically tracks later parent input changes.
+* Do not claim `@StateObject` is a performance optimization over `@ObservedObject`; it is an ownership rule.
+* Do not claim Observation removes the need to think about identity. Observation changes dependency tracking, not identity rules.
 
 ## Minimal checklist
 
 Before finishing an identity/state review, verify:
 
-- IDs are stable, unique, and cheap.
-- `.id(...)` is intentional and not used as a refresh hack.
-- Mutable collections do not use offset or index identity unless the order and membership are fixed.
-- Local `@State` is attached to a stable structural position.
-- `@State` initialized from input is either an intentional snapshot or replaced with derived input.
-- `ObservableObject` created by the view uses `@StateObject`.
-- `ObservableObject` owned elsewhere uses `@ObservedObject` or is passed through without claiming ownership.
-- Owned `@Observable` models use `@State` when the deployment target and architecture support Observation.
-- State is neither lifted too high nor pushed too low for the behavior being modeled.
+* IDs are stable, unique, and cheap.
+* `.id(...)` is intentional and not used as a refresh hack.
+* Mutable collections do not use offset or index identity unless identity is intentionally positional and order/membership are fixed.
+* Conditional modifier helpers are used only for static conditions or intentional structural changes.
+* Local `@State` is attached to a stable structural position.
+* `@State` initialized from input is either an intentional snapshot or replaced with derived input.
+* Snapshot state resets intentionally when the represented entity changes.
+* `ObservableObject` created by the view uses `@StateObject`.
+* `ObservableObject` owned elsewhere uses `@ObservedObject` or is passed through without claiming ownership.
+* Owned `@Observable` models use `@State` when the deployment target and architecture support Observation.
+* UI-facing observable models have clear actor isolation when mutated from async code.
+* State is neither lifted too high nor pushed too low for the behavior being modeled.
