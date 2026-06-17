@@ -3,6 +3,9 @@
 <p align="center">
   <img width="280" alt="Image" src="https://github.com/user-attachments/assets/36210daa-63b7-4619-8084-5410ff63bfdd" />
 </p>
+<p align="center">
+<img width="280" alt="Image" src="https://github.com/user-attachments/assets/a71688d2-54a3-4ea5-8362-e4659b3d46c6" />
+</p>
 
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
