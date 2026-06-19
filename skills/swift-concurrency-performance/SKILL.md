@@ -99,7 +99,7 @@ Read these only when relevant:
 * `references/cancellation-and-task-lifetime.md` — read when the task involves navigation cancellation, long-running work, cancellation propagation, cancellation swallowed by `catch`, task groups, streams, or cancellation tests.
 * `references/bounded-task-groups.md` — read when the task involves `withTaskGroup`, `withThrowingTaskGroup`, parallel mapping, fan-out work, memory spikes, or limiting concurrency.
 * `references/actor-reentrancy.md` — read when the task involves actor-isolated state, duplicate network requests, cache stampedes, state checks before and after `await`, or actor queue buildup.
-* `references/swift-6-2-isolation.md` — read when the task involves Swift 6 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
+* `references/swift-6-isolation.md` — read when the task involves Swift 6 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
 * `references/blocking-legacy-apis.md` — read when the task involves semaphores, synchronous file I/O, blocking networking, locks, callback APIs, old SDKs, or async wrappers around blocking work.
 * `references/continuation-safety.md` — read when the task involves `withCheckedContinuation`, `withCheckedThrowingContinuation`, delegate bridges, callback wrappers, timeout paths, cancellation paths, or exactly-once resume guarantees.
 * `references/asyncsequence-and-stream-cleanup.md` — read when the task involves `AsyncSequence`, `AsyncStream`, `AsyncThrowingStream`, long-running streams, buffering, producer lifetime, `onTermination`, or `for await` loops.
