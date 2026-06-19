@@ -1,6 +1,6 @@
-# Swift 6.2 Isolation and `@concurrent`
+# Swift 6 Isolation and `@concurrent`
 
-Use this reference when the task involves Swift 6.2 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
+Use this reference when the task involves Swift 6 isolation behavior, default actor isolation, `@concurrent`, `nonisolated`, Sendable boundaries, or migration-related performance regressions.
 
 This reference is for performance review. It helps the agent decide where async work actually runs, whether it accidentally remains on `MainActor`, and whether moving work across an isolation boundary is safe.
 
@@ -25,7 +25,7 @@ This reference is for performance review. It helps the agent decide where async 
 
 Do not assume that `async` means “background”.
 
-In Swift 6.2-era code, the execution context of an async function depends on actor isolation, compiler settings, and annotations. A function can be async and still run on the caller’s actor.
+In Swift 6-era code, the execution context of an async function depends on actor isolation, compiler settings, and annotations. A function can be async and still run on the caller’s actor.
 
 For performance review, always ask:
 
@@ -39,7 +39,7 @@ For performance review, always ask:
 
 ## Review workflow
 
-1. 1Identify the user-visible symptom: UI stall, slow interaction, actor queue buildup, new Sendable diagnostics, or regression after enabling Swift 6.2 settings.
+1. 1Identify the user-visible symptom: UI stall, slow interaction, actor queue buildup, new Sendable diagnostics, or regression after enabling Swift 6 settings.
 2. 2Locate the caller’s isolation domain.
 3. 3Locate the callee’s isolation behavior.
 4. 4Check whether heavy work is running on `MainActor` or another hot actor.
@@ -51,7 +51,7 @@ For performance review, always ask:
 
 ## Default actor isolation
 
-Swift 6.2 adds project and package settings that can make declarations in a module infer `@MainActor` isolation by default.
+Swift 6 adds project and package settings that can make declarations in a module infer `@MainActor` isolation by default.
 
 This can improve approachability for UI-heavy apps, but it changes the performance review question:
 
@@ -66,7 +66,7 @@ Review these cases carefully:
 - helper functions near UI code;
 - static utilities in UI modules;
 - protocol conformances that inherit isolation;
-- code that behaved differently after enabling Swift 6.2 settings.
+- code that behaved differently after enabling Swift 6 settings.
 
 Prefer checking the build setting instead of guessing from the source file alone.
 
@@ -381,7 +381,7 @@ For larger workloads, add chunking and cancellation checks.
 
 ## Migration-related performance regressions
 
-Swift 6.2 isolation changes can make code safer and easier to migrate, but they can also move work onto `MainActor` more often than expected.
+Swift 6 isolation changes can make code safer and easier to migrate, but they can also move work onto `MainActor` more often than expected.
 
 Watch for regressions after:
 
@@ -433,7 +433,7 @@ Look for:
 - CPU-heavy work on the main actor;
 - actor queue buildup around one UI-facing type;
 - Sendable diagnostics after adding `@concurrent`;
-- performance regressions after enabling Swift 6.2 settings;
+- performance regressions after enabling Swift 6 settings;
 - code that appears async but does not improve responsiveness.
 
 Likely causes:
@@ -456,7 +456,7 @@ Validation options:
 
 ## Review checklist
 
-Before recommending a Swift 6.2 isolation change, check:
+Before recommending a Swift 6 isolation change, check:
 
 - [ ] Is the caller isolated to `MainActor` or another actor?
 - [ ] Is default actor isolation enabled for this target?
@@ -473,7 +473,7 @@ Before recommending a Swift 6.2 isolation change, check:
 
 ## Source notes
 
-This reference is based on Swift 6.2-era concurrency behavior and should be checked against current Swift documentation when language rules change.
+This reference is based on Swift 6-era concurrency behavior and should be checked against current Swift documentation when language rules change.
 
 Useful primary sources:
 
