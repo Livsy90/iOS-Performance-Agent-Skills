@@ -3,7 +3,7 @@ name: ios-launch-performance
 description: Use this skill when diagnosing iOS app launch performance, startup regressions, first-frame readiness, or early responsiveness. Covers pre-main/dyld work, AppDelegate/SceneDelegate, SwiftUI App startup, launch orchestration, SDK initialization, and launch measurement. Do not use for general performance unless the code runs on the launch path.
 ---
 
-# iOS Launch Performance Expert
+# iOS Launch Performance
 
 Use this skill to review the path from an app launch request to first visible UI and early responsiveness.
 
