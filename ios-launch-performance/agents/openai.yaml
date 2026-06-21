@@ -1,0 +1,8 @@
+interface:
+  display_name: "iOS Launch Performance"
+  short_description: "Cold/warm launch, pre-main dyld work, first frame, SDK init."
+  brand_color: "#F05138"
+  default_prompt: "Use $ios-launch-performance to review this iOS app's launch path for performance."
+
+policy:
+  allow_implicit_invocation: true

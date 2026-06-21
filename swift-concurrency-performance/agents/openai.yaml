@@ -1,0 +1,8 @@
+interface:
+  display_name: "Swift Concurrency Performance"
+  short_description: "Actor hopping, MainActor bottlenecks, task lifecycle, cancellation."
+  brand_color: "#F05138"
+  default_prompt: "Use $swift-concurrency-performance to review this Swift Concurrency code for performance."
+
+policy:
+  allow_implicit_invocation: true
