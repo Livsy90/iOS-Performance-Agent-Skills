@@ -6,7 +6,7 @@
 
 A collection of AI-agent skills for reviewing, diagnosing, and improving performance in iOS applications.
 
-Each skill lives under the `skills/` directory and can be copied manually into another agent setup if needed.
+Each skill lives in its own top-level directory and installs with a single `npx` command (see [Installation](#installation)), or can be copied manually into another agent setup.
 
 ## What this is
 
@@ -54,29 +54,61 @@ For reviewing Swift runtime-level performance costs.
 
 Covers allocations, ARC traffic, stack vs heap behavior, dispatch, existentials, generics, opaque types, copy-on-write, SIL optimization, unsafe Swift, modularization, linking, and launch-time trade-offs.
 
+## Installation
+
+Install the whole bundle with one `npx` command:
+
+```bash
+npx skills add Livsy90/iOS-Performance-Agent-Skills --all
+```
+
+Or install only the skills you want:
+
+```bash
+npx skills add Livsy90/iOS-Performance-Agent-Skills --skill ios-launch-performance --skill swiftui-performance
+```
+
+The CLI will ask which agents to register the skill with (Claude Code, Codex, Cursor, Gemini, ...) and whether to install per-project or globally.
+
+If `npx` is missing, install Node (`brew install node`); if `brew` is missing too, [install Homebrew](https://brew.sh) first.
+
+### Alternative install methods
+
+**Claude Code** (installs the whole bundle directly):
+
+```bash
+/plugin install Livsy90/iOS-Performance-Agent-Skills
+```
+
+Or clone this repository and drop the skill folders wherever your agent expects them.
+
 ## Repository structure
 
 ```text
-skills/
-  ios-launch-performance/
-    SKILL.md
-    references/
+ios-launch-performance/
+  SKILL.md
+  references/
 
-  ios-performance-profiling/
-    SKILL.md
+ios-performance-profiling/
+  SKILL.md
+  references/
 
-  ios-perceived-performance/
-    SKILL.md
-    references/
+ios-perceived-performance/
+  SKILL.md
+  references/
 
-  swiftui-performance/
-    SKILL.md
-    references/
+swiftui-performance/
+  SKILL.md
+  references/
 
-  swift-concurrency-performance/
-    SKILL.md
-    references/
+swift-concurrency-performance/
+  SKILL.md
+  references/
 
-  swift-runtime-performance/
-    SKILL.md
-    references/
+swift-runtime-performance/
+  SKILL.md
+  references/
+
+.claude-plugin/plugin.json    # Claude Code plugin manifest
+gemini-extension.json         # Gemini extension manifest
+```

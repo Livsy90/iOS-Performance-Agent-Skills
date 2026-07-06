@@ -1,0 +1,8 @@
+interface:
+  display_name: "iOS Performance Profiling"
+  short_description: "Instruments, signposts, XCTest metrics, MetricKit, hangs, hitches."
+  brand_color: "#F05138"
+  default_prompt: "Use $ios-performance-profiling to choose and interpret profiling for this iOS issue."
+
+policy:
+  allow_implicit_invocation: true

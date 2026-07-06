@@ -1,0 +1,7 @@
+{
+  "name": "ios-performance-agent-skills",
+  "description": "iOS performance expert skills: app launch, perceived performance, Instruments-driven profiling, SwiftUI rendering, Swift Concurrency, and Swift runtime costs.",
+  "version": "1.0.0",
+  "author": "Artem (Livsy90)",
+  "repository": "https://github.com/Livsy90/iOS-Performance-Agent-Skills"
+}

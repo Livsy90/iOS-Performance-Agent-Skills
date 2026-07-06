@@ -1,0 +1,8 @@
+interface:
+  display_name: "Swift Runtime Performance"
+  short_description: "Allocations, ARC, dispatch, existentials vs generics, COW, SIL."
+  brand_color: "#F05138"
+  default_prompt: "Use $swift-runtime-performance to review this Swift code for runtime performance costs."
+
+policy:
+  allow_implicit_invocation: true

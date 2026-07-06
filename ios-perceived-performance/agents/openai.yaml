@@ -1,0 +1,8 @@
+interface:
+  display_name: "iOS Perceived Performance"
+  short_description: "Loading states, progressive rendering, optimistic updates, skeletons."
+  brand_color: "#F05138"
+  default_prompt: "Use $ios-perceived-performance to improve how fast this iOS flow feels."
+
+policy:
+  allow_implicit_invocation: true

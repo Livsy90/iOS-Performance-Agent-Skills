@@ -1,0 +1,8 @@
+interface:
+  display_name: "SwiftUI Performance"
+  short_description: "Identity, invalidation, body cost, lists, layout, drawing, hitches."
+  brand_color: "#F05138"
+  default_prompt: "Use $swiftui-performance to review this SwiftUI code for performance."
+
+policy:
+  allow_implicit_invocation: true
