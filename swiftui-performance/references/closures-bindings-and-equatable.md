@@ -14,6 +14,7 @@ The goal is not to remove every closure, avoid every custom binding, or make eve
 * [Single action router pattern](#single-action-router-pattern)
 * [Gestures, menus, and swipe actions](#gestures-menus-and-swipe-actions)
 * [Custom bindings](#custom-bindings)
+* [Subscript projections for derived bindings](#subscript-projections-for-derived-bindings)
 * [Key-path bindings with Observation](#key-path-bindings-with-observation)
 * [Binding red flags](#binding-red-flags)
 * [Equatable views](#equatable-views)
@@ -302,7 +303,7 @@ Toggle(
 
 A custom `Binding(get:set:)` is not automatically wrong. It often introduces fresh closures, broader captures, and hidden transformation logic inside rendering code.
 
-Use a custom binding when the binding really needs transformation, validation, optional handling, clamping, logging, or routing to a model method.
+Use `Binding(get:set:)` for small, local transformations such as optional handling, clamping, validation, logging, or routing to a model method.
 
 Valid use case:
 
@@ -317,7 +318,36 @@ TextField(
 )
 ```
 
-When custom binding logic grows, move the behavior to a named helper or model method so the view does not hide business rules inside `body`.
+When the same derived read/write relationship is meaningful and reusable across views, expose it as a writable property or labeled subscript on the model instead of rebuilding the custom binding inside `body`.
+
+## Subscript projections for derived bindings
+
+A labeled subscript is useful when a derived read/write relationship belongs to the model and needs an argument, such as an item ID.
+
+```swift
+@Observable
+final class FavoritesModel {
+    var favoriteIDs: Set<Article.ID> = []
+
+    subscript(isFavorite id: Article.ID) -> Bool {
+        get { favoriteIDs.contains(id) }
+        set {
+            if newValue {
+                favoriteIDs.insert(id)
+            } else {
+                favoriteIDs.remove(id)
+            }
+        }
+    }
+}
+
+ArticleRow(
+    article: article,
+    isFavorite: $model[isFavorite: article.id]
+)
+```
+
+The subscript acts like a writable computed property with an argument, allowing SwiftUI to form a binding through the model's projected value. Use it when the projection is meaningful and reusable; keep Binding(get:set:) for small, local transformations.
 
 ## Key-path bindings with Observation
 
