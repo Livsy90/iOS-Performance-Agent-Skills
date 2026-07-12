@@ -340,7 +340,8 @@ final class FavoritesModel {
         }
     }
 }
-
+```
+```swift
 ArticleRow(
     article: article,
     isFavorite: $model[isFavorite: article.id]
